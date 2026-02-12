@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "noEmit": true,
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "paths": {
+      "@vituum/vite-plugin-posthtml/*": ["./*"],
+      "vituum/*": ["./node_modules/vituum/*"]
+    }
+  },
+  "include": [
+    "index.js",
+    "node_modules/vituum",
+    "./types/**/*.d.ts"
+  ],
+  "files": [
+    "index.js"
+  ]
+}
