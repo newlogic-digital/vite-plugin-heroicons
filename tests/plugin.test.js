@@ -132,7 +132,7 @@ describe('heroicons plugin', () => {
     expect(context.emitted).toHaveLength(1)
 
     context.emitted.length = 0
-    plugin.handleHotUpdate({ file: '/src/page.html' })
+    plugin.hotUpdate({ file: '/src/page.html' })
 
     await plugin.generateBundle.call(context.hooks)
     expect(context.emitted).toHaveLength(0)
@@ -196,6 +196,33 @@ describe('heroicons plugin', () => {
     await plugin.generateBundle.call(context.hooks)
     expect(readSpy).toHaveBeenCalledTimes(1)
     expect(context.emitted).toHaveLength(1)
+  })
+
+  it('skips collecting refs during server transforms via environment consumer', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({
+      inject: false,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    plugin.transform.handler.call(
+      { environment: { config: { consumer: 'server' } } },
+      '<use href="#foo/check"></use>',
+      '/src/page.html',
+    )
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks)
+
+    expect(context.emitted).toHaveLength(0)
   })
 
   it('builds transform code filter from configured icon prefixes', () => {

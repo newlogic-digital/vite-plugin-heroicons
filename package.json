@@ -1,6 +1,6 @@
 {
   "name": "@newlogic-digital/vite-plugin-heroicons",
-  "version": "0.0.1",
+  "version": "0.0.4",
   "type": "module",
   "main": "index.js",
   "types": "types/index.d.ts",
@@ -44,6 +44,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/@newlogic-digital/vite-plugin-heroicons.git"
+    "url": "git+https://github.com/newlogic-digital/vite-plugin-heroicons.git"
   }
 }

@@ -30,19 +30,24 @@ const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const escapeAttributeValue = value => String(value).replaceAll('&', '&amp;').replaceAll('"', '&quot;')
 const normalizeIdKey = (id = '') => normalizePath(id.split('?')[0])
 
-const sameSet = (left, right) => {
-  if (!left || !right || left.size !== right.size) return false
-  for (const value of left) {
-    if (!right.has(value)) return false
-  }
-  return true
-}
+const isServerTransform = (ctx, options) => (
+  ctx?.environment?.config?.consumer === 'server'
+  || options?.ssr === true
+)
 
 const containsAnyNeedle = (content, needles) => {
   for (const needle of needles) {
     if (content.includes(needle)) return true
   }
   return false
+}
+
+const sameSet = (left, right) => {
+  if (!left || !right || left.size !== right.size) return false
+  for (const value of left) {
+    if (!right.has(value)) return false
+  }
+  return true
 }
 
 const parseViewBox = (attributes) => {
@@ -65,8 +70,15 @@ const buildHrefRegExp = (prefixes) => {
   )
 }
 
-const extractIconIds = (content, hrefRe) => {
-  if (!hrefRe || typeof content !== 'string' || content.length === 0) return EMPTY_ICON_IDS
+const extractIconIds = (content, hrefRe, needles) => {
+  if (
+    !hrefRe
+    || typeof content !== 'string'
+    || content.length === 0
+    || !containsAnyNeedle(content, needles)
+  ) {
+    return EMPTY_ICON_IDS
+  }
 
   const iconIds = new Set()
   hrefRe.lastIndex = 0
@@ -96,11 +108,8 @@ export default function heroicons(userOptions = {}) {
     refsByFile: new Map(),
     refCountById: new Map(),
     symbolById: new Map(),
-    pendingSymbolById: new Map(),
     warnedIds: new Set(),
     iconDirs: {},
-    sortedIds: [],
-    sortedIdsDirty: true,
     spriteDirty: true,
     /** @type {{ full: string, inner: string }} */
     sprite: EMPTY_SPRITE,
@@ -112,19 +121,11 @@ export default function heroicons(userOptions = {}) {
     return state.sprite
   }
 
-  const markDirty = () => {
-    state.sortedIdsDirty = true
-    state.spriteDirty = true
-  }
-
   const resetBuildState = () => {
     state.refsByFile.clear()
     state.refCountById.clear()
     state.symbolById.clear()
-    state.pendingSymbolById.clear()
     state.warnedIds.clear()
-    state.sortedIds = []
-    state.sortedIdsDirty = true
     state.spriteDirty = true
     state.sprite = EMPTY_SPRITE
   }
@@ -133,8 +134,6 @@ export default function heroicons(userOptions = {}) {
     const nextCount = (state.refCountById.get(iconId) ?? 0) + delta
     if (nextCount <= 0) {
       state.refCountById.delete(iconId)
-      state.symbolById.delete(iconId)
-      state.pendingSymbolById.delete(iconId)
       return
     }
     state.refCountById.set(iconId, nextCount)
@@ -157,15 +156,13 @@ export default function heroicons(userOptions = {}) {
       for (const iconId of nextIds) updateRefCount(iconId, 1)
     }
 
-    markDirty()
+    state.spriteDirty = true
   }
 
-  const getSortedIds = () => {
-    if (state.sortedIdsDirty) {
-      state.sortedIds = [...state.refCountById.keys()].sort()
-      state.sortedIdsDirty = false
-    }
-    return state.sortedIds
+  const clearFileRefs = (filePath) => {
+    const normalized = normalizeIdKey(filePath)
+    replaceFileRefs(normalized, EMPTY_ICON_IDS)
+    replaceFileRefs(`html:${normalized}`, EMPTY_ICON_IDS)
   }
 
   const warnOnce = (ctx, iconId, message) => {
@@ -175,62 +172,52 @@ export default function heroicons(userOptions = {}) {
   }
 
   const loadSymbol = async (ctx, iconId) => {
-    if (state.symbolById.has(iconId)) return state.symbolById.get(iconId)
+    const cached = state.symbolById.get(iconId)
+    if (cached) return cached
 
-    const pending = state.pendingSymbolById.get(iconId)
-    if (pending) return pending
+    const slash = iconId.indexOf('/')
+    if (slash <= 0 || slash >= iconId.length - 1) return null
 
-    const loading = (async () => {
-      const slash = iconId.indexOf('/')
-      if (slash <= 0 || slash >= iconId.length - 1) return null
+    const prefix = iconId.slice(0, slash)
+    const iconName = iconId.slice(slash + 1)
+    const iconDir = state.iconDirs[prefix]
+    if (!iconDir) return null
 
-      const prefix = iconId.slice(0, slash)
-      const iconName = iconId.slice(slash + 1)
-      const iconDir = state.iconDirs[prefix]
-      if (!iconDir) return null
+    const iconPath = path.join(iconDir, `${iconName}.svg`)
 
-      const iconPath = path.join(iconDir, `${iconName}.svg`)
+    let source
+    try {
+      source = await fs.readFile(iconPath, 'utf8')
+    }
+    catch {
+      warnOnce(ctx, iconId, `Missing icon "${iconId}" at ${iconPath}`)
+      return null
+    }
 
-      let source
-      try {
-        source = await fs.readFile(iconPath, 'utf8')
-      }
-      catch {
-        warnOnce(ctx, iconId, `Missing heroicon "${iconId}" at ${iconPath}`)
-        return null
-      }
+    const svgMatch = source.match(SVG_RE)
+    if (!svgMatch) {
+      warnOnce(ctx, iconId, `Invalid SVG for icon "${iconId}" at ${iconPath}`)
+      return null
+    }
 
-      const svgMatch = source.match(SVG_RE)
-      if (!svgMatch) {
-        warnOnce(ctx, iconId, `Invalid SVG for heroicon "${iconId}" at ${iconPath}`)
-        return null
-      }
+    const viewBox = parseViewBox(svgMatch[1])
+    if (!viewBox) {
+      warnOnce(ctx, iconId, `Missing viewBox for icon "${iconId}" at ${iconPath}`)
+      return null
+    }
 
-      const viewBox = parseViewBox(svgMatch[1])
-      if (!viewBox) {
-        warnOnce(ctx, iconId, `Missing viewBox for heroicon "${iconId}" at ${iconPath}`)
-        return null
-      }
+    let body = svgMatch[2].replace(BASE_STRIP_RE, '')
+    if (prefix === 'heroicons-outline') body = body.replace(OUTLINE_STRIP_RE, '')
 
-      let body = svgMatch[2].replace(BASE_STRIP_RE, '')
-      if (prefix === 'heroicons-outline') body = body.replace(OUTLINE_STRIP_RE, '')
-
-      const symbol = `<symbol id="${escapeAttributeValue(iconId)}" viewBox="${escapeAttributeValue(viewBox)}">${body.trim()}</symbol>`
-      state.symbolById.set(iconId, symbol)
-      return symbol
-    })()
-      .finally(() => {
-        state.pendingSymbolById.delete(iconId)
-      })
-
-    state.pendingSymbolById.set(iconId, loading)
-    return loading
+    const symbol = `<symbol id="${escapeAttributeValue(iconId)}" viewBox="${escapeAttributeValue(viewBox)}">${body.trim()}</symbol>`
+    state.symbolById.set(iconId, symbol)
+    return symbol
   }
 
   const getSprite = async (ctx) => {
     if (!state.spriteDirty) return state.sprite
 
-    const iconIds = getSortedIds()
+    const iconIds = [...state.refCountById.keys()].sort()
     if (iconIds.length === 0) return setEmptySprite()
 
     const symbols = await Promise.all(iconIds.map(iconId => loadSymbol(ctx, iconId)))
@@ -263,25 +250,24 @@ export default function heroicons(userOptions = {}) {
         code: codeFilter,
       },
       handler(code, id, transformOptions) {
-        if (transformOptions?.ssr || !hrefRe) return null
-        replaceFileRefs(normalizeIdKey(id), extractIconIds(code, hrefRe))
+        if (!hrefRe || isServerTransform(this, transformOptions)) return null
+
+        // Fallback guard for environments that don't support hook filters yet.
+        if (!TRANSFORM_ID_RE.test(id)) return null
+
+        replaceFileRefs(normalizeIdKey(id), extractIconIds(code, hrefRe, codeNeedles))
         return null
       },
     },
-    handleHotUpdate(ctx) {
-      const normalized = normalizeIdKey(ctx.file)
-      replaceFileRefs(normalized, EMPTY_ICON_IDS)
-      replaceFileRefs(`html:${normalized}`, EMPTY_ICON_IDS)
+    hotUpdate(options) {
+      clearFileRefs(options.file)
     },
     transformIndexHtml: {
       order: 'post',
       async handler(html, ctx) {
         const key = `html:${normalizeIdKey(ctx.filename ?? ctx.path)}`
-        const iconIds = containsAnyNeedle(html, codeNeedles)
-          ? extractIconIds(html, hrefRe)
-          : EMPTY_ICON_IDS
+        replaceFileRefs(key, extractIconIds(html, hrefRe, codeNeedles))
 
-        replaceFileRefs(key, iconIds)
         if (!options.inject) return html
 
         const sprite = await getSprite(this)
@@ -294,7 +280,7 @@ export default function heroicons(userOptions = {}) {
               tag: 'svg',
               attrs: options.className ? { class: options.className } : {},
               children: sprite.inner,
-              injectTo: 'body-prepend',
+              injectTo: 'body',
             },
           ],
         }
