@@ -7,12 +7,16 @@
   "scripts": {
     "lint": "npm run eslint && npm run tsc",
     "tsc": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "node scripts/bench.mjs",
     "eslint": "eslint '**/*.js'",
     "eslint-fix": "eslint '**/*.js' --fix",
     "publish-next": "npm publish --tag next"
   },
-  "dependencies": {
-    "heroicons": "^2.2.0"
+  "peerDependencies": {
+    "heroicons": "^2",
+    "vite": "^8.0.0-beta.14"
   },
   "devDependencies": {
     "@eslint/js": "^9.39",
@@ -20,8 +24,10 @@
     "@types/node": "^25.0",
     "eslint": "^9.39",
     "globals": "^17.0",
+    "heroicons": "^2.2.0",
     "typescript": "^5.9",
-    "vite": "^8.0.0-beta.14"
+    "vite": "^8.0.0-beta.14",
+    "vitest": "^4.0.18"
   },
   "files": [
     "index.js",
