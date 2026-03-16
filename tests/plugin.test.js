@@ -14,6 +14,11 @@ const solidSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0
 </svg>
 `
 
+const largeSolidSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path d="M1 1h22v22H1z"/>
+</svg>
+`
+
 const tempRoots = []
 
 const createTempRoot = async () => {
@@ -161,6 +166,33 @@ describe('heroicons plugin', () => {
     await plugin.generateBundle.call(context.hooks)
 
     expect(context.warnings).toHaveLength(1)
+  })
+
+  it('resolves icon sets from multiple directories in order', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons-primary', 'star', largeSolidSvg)
+    await addIcon(root, 'icons-fallback', 'check', solidSvg)
+    await addIcon(root, 'icons-fallback', 'star', solidSvg)
+
+    const plugin = heroicons({
+      inject: false,
+      iconSets: {
+        foo: ['icons-primary', 'icons-fallback'],
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    plugin.transform.handler('<use href="#foo/check"></use><use href="#foo/star"></use>', '/src/app.html', { ssr: false })
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks)
+
+    expect(context.emitted).toHaveLength(1)
+    expect(context.emitted[0].source).toContain('id="foo/check" viewBox="0 0 20 20"')
+    expect(context.emitted[0].source).toContain('id="foo/star" viewBox="0 0 24 24"')
   })
 
   it('injects sprite with HtmlTagDescriptor and reuses cache for bundle', async () => {

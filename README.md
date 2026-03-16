@@ -20,7 +20,17 @@ export default {
 - `fileName` (`string`, default: `"heroicons.svg"`): emitted asset file name.
 - `className` (`string`, default: `"hidden"`): class on generated sprite `<svg>`.
 - `inject` (`boolean`, default: `true`): inject sprite into transformed HTML via `transformIndexHtml`.
-- `iconSets` (`Record<string, string>`): icon prefix to directory mapping.
+- `iconSets` (`Record<string, string | string[]>`): icon prefix to directory mapping. When you pass an array, the plugin searches directories in order and uses the first matching icon.
+
+```js
+heroicons({
+  iconSets: {
+    'simpleicons-solid': ['src/icons/simpleicons', 'other-path'],
+    'icons-solid': 'src/icons/solid',
+    'icons-outline': 'src/icons/outline',
+  },
+})
+```
 
 ## Requirements
 

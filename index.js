@@ -29,6 +29,11 @@ const EMPTY_SPRITE = { full: '', inner: '' }
 const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const escapeAttributeValue = value => String(value).replaceAll('&', '&amp;').replaceAll('"', '&quot;')
 const normalizeIdKey = (id = '') => normalizePath(id.split('?')[0])
+const resolveIconSetPaths = (root, iconSetPath) => (
+  (Array.isArray(iconSetPath) ? iconSetPath : [iconSetPath]).map(candidatePath => (
+    path.isAbsolute(candidatePath) ? candidatePath : path.resolve(root, candidatePath)
+  ))
+)
 
 const isServerTransform = (ctx, options) => (
   ctx?.environment?.config?.consumer === 'server'
@@ -180,17 +185,30 @@ export default function heroicons(userOptions = {}) {
 
     const prefix = iconId.slice(0, slash)
     const iconName = iconId.slice(slash + 1)
-    const iconDir = state.iconDirs[prefix]
-    if (!iconDir) return null
+    const iconDirs = state.iconDirs[prefix]
+    if (!iconDirs?.length) return null
 
-    const iconPath = path.join(iconDir, `${iconName}.svg`)
-
+    let iconPath
     let source
-    try {
-      source = await fs.readFile(iconPath, 'utf8')
+    const searchedPaths = []
+
+    for (const iconDir of iconDirs) {
+      iconPath = path.join(iconDir, `${iconName}.svg`)
+      searchedPaths.push(iconPath)
+
+      try {
+        source = await fs.readFile(iconPath, 'utf8')
+        break
+      }
+      catch (error) {
+        if (error?.code === 'ENOENT') continue
+        warnOnce(ctx, iconId, `Failed to read icon "${iconId}" at ${iconPath}: ${error.message}`)
+        return null
+      }
     }
-    catch {
-      warnOnce(ctx, iconId, `Missing icon "${iconId}" at ${iconPath}`)
+
+    if (!source) {
+      warnOnce(ctx, iconId, `Missing icon "${iconId}" in ${searchedPaths.join(', ')}`)
       return null
     }
 
@@ -237,7 +255,7 @@ export default function heroicons(userOptions = {}) {
       state.iconDirs = Object.fromEntries(
         Object.entries(options.iconSets).map(([prefix, iconSetPath]) => [
           prefix,
-          path.isAbsolute(iconSetPath) ? iconSetPath : path.resolve(config.root, iconSetPath),
+          resolveIconSetPaths(config.root, iconSetPath),
         ]),
       )
     },
