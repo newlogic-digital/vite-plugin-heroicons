@@ -13,7 +13,7 @@ const DEFAULT_OPTIONS = {
   fileName: 'heroicons.svg',
   className: 'hidden',
   inject: true,
-  injectExclude: /\.json(?:\.|$)/i,
+  injectExclude: /\.json\.[^.]+\.html$/i,
 }
 
 const SVG_RE = /<svg\b([^>]*)>([\s\S]*?)<\/svg>/i

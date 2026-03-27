@@ -1,6 +1,6 @@
 {
   "name": "@newlogic-digital/vite-plugin-heroicons",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "main": "index.js",
   "types": "types/index.d.ts",

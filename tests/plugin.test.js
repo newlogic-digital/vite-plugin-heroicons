@@ -260,6 +260,33 @@ describe('heroicons plugin', () => {
     expect(context.emitted[0].source).toContain('id="foo/check"')
   })
 
+  it('still injects sprite for direct .json.html pages', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({
+      inject: true,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const transformed = await plugin.transformIndexHtml.handler.call(
+      context.hooks,
+      '<html><body><use href="#foo/check"></use></body></html>',
+      { filename: '/src/pages/basic.json.html', path: '/basic.json.html' },
+    )
+
+    expect(typeof transformed).toBe('object')
+    expect(transformed.tags).toHaveLength(1)
+    expect(transformed.tags[0].children).toContain('id="foo/check"')
+  })
+
   it('allows overriding injectExclude for json-like HTML outputs', async () => {
     const root = await createTempRoot()
 
