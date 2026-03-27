@@ -1,11 +1,13 @@
 import type { Plugin } from 'vite'
 
 export type HeroiconsIconSetPath = string | string[]
+export type HeroiconsPathPattern = string | RegExp
 
 export interface HeroiconsOptions {
   fileName?: string
   className?: string
   inject?: boolean
+  injectExclude?: HeroiconsPathPattern | HeroiconsPathPattern[]
   iconSets?: Record<string, HeroiconsIconSetPath>
 }
 

@@ -13,6 +13,7 @@ const DEFAULT_OPTIONS = {
   fileName: 'heroicons.svg',
   className: 'hidden',
   inject: true,
+  injectExclude: /\.json(?:\.|$)/i,
 }
 
 const SVG_RE = /<svg\b([^>]*)>([\s\S]*?)<\/svg>/i
@@ -29,6 +30,7 @@ const EMPTY_SPRITE = { full: '', inner: '' }
 const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const escapeAttributeValue = value => String(value).replaceAll('&', '&amp;').replaceAll('"', '&quot;')
 const normalizeIdKey = (id = '') => normalizePath(id.split('?')[0])
+const toArray = value => (Array.isArray(value) ? value : value == null ? [] : [value])
 const resolveIconSetPaths = (root, iconSetPath) => (
   (Array.isArray(iconSetPath) ? iconSetPath : [iconSetPath]).map(candidatePath => (
     path.isAbsolute(candidatePath) ? candidatePath : path.resolve(root, candidatePath)
@@ -44,6 +46,17 @@ const containsAnyNeedle = (content, needles) => {
   for (const needle of needles) {
     if (content.includes(needle)) return true
   }
+  return false
+}
+
+const matchesPathPattern = (value, pattern) => {
+  if (typeof pattern === 'string') return value.includes(pattern)
+
+  if (pattern instanceof RegExp) {
+    pattern.lastIndex = 0
+    return pattern.test(value)
+  }
+
   return false
 }
 
@@ -248,6 +261,11 @@ export default function heroicons(userOptions = {}) {
     return state.sprite
   }
 
+  const shouldSkipHtmlInject = (id) => {
+    const normalizedId = normalizeIdKey(id)
+    return normalizedId.length > 0 && toArray(options.injectExclude).some(pattern => matchesPathPattern(normalizedId, pattern))
+  }
+
   return {
     name: '@newlogic-digital/vite-plugin-heroicons',
     enforce: 'post',
@@ -283,10 +301,11 @@ export default function heroicons(userOptions = {}) {
     transformIndexHtml: {
       order: 'post',
       async handler(html, ctx) {
-        const key = `html:${normalizeIdKey(ctx.filename ?? ctx.path)}`
+        const normalizedId = normalizeIdKey(ctx.filename ?? ctx.path)
+        const key = `html:${normalizedId}`
         replaceFileRefs(key, extractIconIds(html, hrefRe, codeNeedles))
 
-        if (!options.inject) return html
+        if (!options.inject || shouldSkipHtmlInject(normalizedId)) return html
 
         const sprite = await getSprite(this)
         if (!sprite.inner) return html

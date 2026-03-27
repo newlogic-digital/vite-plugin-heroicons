@@ -230,6 +230,64 @@ describe('heroicons plugin', () => {
     expect(context.emitted).toHaveLength(1)
   })
 
+  it('skips sprite injection for json-like HTML outputs by default', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({
+      inject: true,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const html = '{"content":"<use href=#foo/check></use>"}'
+    const transformed = await plugin.transformIndexHtml.handler.call(
+      context.hooks,
+      html,
+      { filename: '/src/pages/basic.json.latte.html', path: '/basic.json.html' },
+    )
+
+    expect(transformed).toBe(html)
+
+    await plugin.generateBundle.call(context.hooks)
+    expect(context.emitted).toHaveLength(1)
+    expect(context.emitted[0].source).toContain('id="foo/check"')
+  })
+
+  it('allows overriding injectExclude for json-like HTML outputs', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({
+      inject: true,
+      injectExclude: [],
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const transformed = await plugin.transformIndexHtml.handler.call(
+      context.hooks,
+      '{"content":"<use href=#foo/check></use>"}',
+      { filename: '/src/pages/basic.json.latte.html', path: '/basic.json.html' },
+    )
+
+    expect(typeof transformed).toBe('object')
+    expect(transformed.tags).toHaveLength(1)
+    expect(transformed.tags[0].children).toContain('id="foo/check"')
+  })
+
   it('skips collecting refs during server transforms via environment consumer', async () => {
     const root = await createTempRoot()
 
