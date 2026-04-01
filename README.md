@@ -19,12 +19,14 @@ export default {
 
 - `fileName` (`string`, default: `"heroicons.svg"`): emitted asset file name.
 - `className` (`string`, default: `"hidden"`): class on generated sprite `<svg>`.
+- `content` (`string | string[]`): additional build-only root-relative file paths or glob patterns scanned with ripgrep before `heroicons.svg` is emitted. This affects the emitted sprite only, not HTML injection.
 - `inject` (`boolean`, default: `true`): inject sprite into transformed HTML via `transformIndexHtml`.
 - `injectExclude` (`string | RegExp | Array<string | RegExp>`, default: `/\.json\.[^.]+\.html$/i`): skip sprite injection for matching HTML output paths. By default this targets JSON endpoints rendered through a template extension such as `basic.json.latte.html`, while still allowing normal HTML pages like `basic.json.html`.
 - `iconSets` (`Record<string, string | string[]>`): icon prefix to directory mapping. When you pass an array, the plugin searches directories in order and uses the first matching icon.
 
 ```js
 heroicons({
+  content: ['templates/**/*.{latte,twig}'],
   injectExclude: [/\.json\.[^.]+\.html$/i, /\.modal\./i],
   iconSets: {
     'simpleicons-solid': ['src/icons/simpleicons', 'other-path'],
@@ -33,6 +35,8 @@ heroicons({
   },
 })
 ```
+
+When using `content`, [`ripgrep`](https://github.com/BurntSushi/ripgrep) must be installed and available as `rg` in your `PATH`.
 
 ## Requirements
 

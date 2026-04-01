@@ -1,5 +1,8 @@
+import { Buffer } from 'node:buffer'
 import { promises as fs } from 'node:fs'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
+import process from 'node:process'
 import { normalizePath } from 'vite'
 
 const DEFAULT_ICON_SETS = {
@@ -12,6 +15,7 @@ const DEFAULT_ICON_SETS = {
 const DEFAULT_OPTIONS = {
   fileName: 'heroicons.svg',
   className: 'hidden',
+  content: undefined,
   inject: true,
   injectExclude: /\.json\.[^.]+\.html$/i,
 }
@@ -60,6 +64,42 @@ const matchesPathPattern = (value, pattern) => {
   return false
 }
 
+const runRipgrep = (args, cwd) => new Promise((resolve, reject) => {
+  const child = spawn('rg', args, {
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  /** @type {Buffer[]} */
+  const stdoutChunks = []
+  /** @type {Buffer[]} */
+  const stderrChunks = []
+
+  child.stdout.on('data', chunk => stdoutChunks.push(chunk))
+  child.stderr.on('data', chunk => stderrChunks.push(chunk))
+  child.on('error', (error) => {
+    const spawnError = /** @type {NodeJS.ErrnoException} */ (error)
+
+    if (spawnError.code === 'ENOENT') {
+      reject(new Error('ripgrep (`rg`) was not found in PATH'))
+      return
+    }
+
+    reject(spawnError)
+  })
+  child.on('close', (code) => {
+    const stdout = Buffer.concat(stdoutChunks).toString('utf8')
+    const stderr = Buffer.concat(stderrChunks).toString('utf8').trim()
+
+    if (code === 0 || code === 1) {
+      resolve({ code, stdout, stderr })
+      return
+    }
+
+    reject(new Error(stderr || `ripgrep exited with code ${code}`))
+  })
+})
+
 const sameSet = (left, right) => {
   if (!left || !right || left.size !== right.size) return false
   for (const value of left) {
@@ -73,20 +113,27 @@ const parseViewBox = (attributes) => {
   return match ? (match[1] ?? match[2] ?? match[3] ?? null) : null
 }
 
-const buildHrefRegExp = (prefixes) => {
-  const pattern = prefixes
+const buildIconIdPattern = (prefixes) => {
+  const prefixPattern = prefixes
     .filter(prefix => typeof prefix === 'string' && prefix.length > 0)
     .map(prefix => escapeRegExp(prefix))
     .join('|')
 
-  if (!pattern) return null
-  const iconIdPattern = `(?:${pattern})\\/[a-z0-9-]+`
-
-  return new RegExp(
-    String.raw`\b(?:xlink:)?href\s*=\s*(?:(["'])#(${iconIdPattern})\1|#(${iconIdPattern})(?=[\s>]))`,
-    'gi',
-  )
+  return prefixPattern ? `(?:${prefixPattern})\\/[a-z0-9-]+` : null
 }
+
+const buildHrefPattern = iconIdPattern => (
+  iconIdPattern
+    ? String.raw`\b(?:xlink:)?href\s*=\s*(?:(["'])#(${iconIdPattern})\1|#(${iconIdPattern})(?=[\s>]))`
+    : null
+)
+
+const buildHrefRegExp = (prefixes) => {
+  const hrefPattern = buildHrefPattern(buildIconIdPattern(prefixes))
+  return hrefPattern ? new RegExp(hrefPattern, 'gi') : null
+}
+
+const buildContentHrefPattern = prefixes => buildHrefPattern(buildIconIdPattern(prefixes))
 
 const extractIconIds = (content, hrefRe, needles) => {
   if (
@@ -120,6 +167,7 @@ export default function heroicons(userOptions = {}) {
   const prefixes = Object.keys(options.iconSets)
   const codeNeedles = prefixes.map(prefix => `#${prefix}/`)
   const hrefRe = buildHrefRegExp(prefixes)
+  const contentHrefPattern = buildContentHrefPattern(prefixes)
   const codeFilter = codeNeedles.length <= 1 ? (codeNeedles[0] ?? '#heroicons-') : { include: codeNeedles }
 
   const state = {
@@ -128,6 +176,8 @@ export default function heroicons(userOptions = {}) {
     symbolById: new Map(),
     warnedIds: new Set(),
     iconDirs: {},
+    root: process.cwd(),
+    contentScanned: false,
     spriteDirty: true,
     /** @type {{ full: string, inner: string }} */
     sprite: EMPTY_SPRITE,
@@ -144,6 +194,7 @@ export default function heroicons(userOptions = {}) {
     state.refCountById.clear()
     state.symbolById.clear()
     state.warnedIds.clear()
+    state.contentScanned = false
     state.spriteDirty = true
     state.sprite = EMPTY_SPRITE
   }
@@ -261,6 +312,70 @@ export default function heroicons(userOptions = {}) {
     return state.sprite
   }
 
+  const resolveContentPatterns = (ctx) => {
+    const patterns = []
+    for (const rawPattern of toArray(options.content)) {
+      if (typeof rawPattern !== 'string' || rawPattern.length === 0) continue
+
+      const pattern = path.isAbsolute(rawPattern)
+        ? normalizePath(path.relative(state.root, rawPattern))
+        : normalizePath(rawPattern)
+
+      if (pattern.startsWith('../')) {
+        ctx.warn(`Skipping content entry "${rawPattern}" because it is outside the Vite root.`)
+        continue
+      }
+
+      patterns.push(pattern)
+    }
+
+    return patterns
+  }
+
+  const scanContentRefs = async (ctx) => {
+    if (state.contentScanned || !contentHrefPattern) return
+    state.contentScanned = true
+
+    if (!options.content) return
+
+    const contentPatterns = resolveContentPatterns(ctx)
+    if (contentPatterns.length === 0) return
+
+    const args = [
+      '-P',
+      '-o',
+      '--no-filename',
+      '--replace', '$2$3',
+      '--no-config',
+      '--color=never',
+      '--hidden',
+      '--glob', '!**/.git/**',
+      '--glob', '!**/node_modules/**',
+      '--glob', '!**/dist/**',
+      ...contentPatterns.flatMap(pattern => ['--glob', pattern]),
+      contentHrefPattern,
+      '.',
+    ]
+
+    /** @type {{ stdout: string }} */
+    let result
+    try {
+      result = await runRipgrep(args, state.root)
+    }
+    catch (error) {
+      ctx.warn(`Failed to scan content files with ripgrep: ${error.message}`)
+      return
+    }
+
+    const iconIds = new Set(
+      result.stdout
+        .split(/\r?\n/)
+        .filter(Boolean),
+    )
+
+    replaceFileRefs('content:build', iconIds.size > 0 ? iconIds : EMPTY_ICON_IDS)
+  }
+
   const shouldSkipHtmlInject = (id) => {
     const normalizedId = normalizeIdKey(id)
     return normalizedId.length > 0 && toArray(options.injectExclude).some(pattern => matchesPathPattern(normalizedId, pattern))
@@ -270,6 +385,7 @@ export default function heroicons(userOptions = {}) {
     name: '@newlogic-digital/vite-plugin-heroicons',
     enforce: 'post',
     configResolved(config) {
+      state.root = config.root
       state.iconDirs = Object.fromEntries(
         Object.entries(options.iconSets).map(([prefix, iconSetPath]) => [
           prefix,
@@ -325,6 +441,8 @@ export default function heroicons(userOptions = {}) {
       },
     },
     async generateBundle() {
+      await scanContentRefs(this)
+
       const sprite = await getSprite(this)
       if (!sprite.full) return
 

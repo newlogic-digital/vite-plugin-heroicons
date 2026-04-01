@@ -6,6 +6,7 @@ export type HeroiconsPathPattern = string | RegExp
 export interface HeroiconsOptions {
   fileName?: string
   className?: string
+  content?: string | string[]
   inject?: boolean
   injectExclude?: HeroiconsPathPattern | HeroiconsPathPattern[]
   iconSets?: Record<string, HeroiconsIconSetPath>

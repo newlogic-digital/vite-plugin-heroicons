@@ -33,6 +33,12 @@ const addIcon = async (root, relativeDir, iconName, content) => {
   await fsPromises.writeFile(path.join(iconDir, `${iconName}.svg`), content, 'utf8')
 }
 
+const addFile = async (root, relativePath, content) => {
+  const filePath = path.join(root, relativePath)
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true })
+  await fsPromises.writeFile(filePath, content, 'utf8')
+}
+
 const createContext = () => {
   const warnings = []
   const emitted = []
@@ -166,6 +172,55 @@ describe('heroicons plugin', () => {
     await plugin.generateBundle.call(context.hooks)
 
     expect(context.warnings).toHaveLength(1)
+  })
+
+  it('collects icons from content files during generateBundle', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'templates/page.latte', '<use href="#foo/check"></use>')
+
+    const plugin = heroicons({
+      content: ['templates/**/*.latte'],
+      inject: false,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks)
+
+    expect(context.emitted).toHaveLength(1)
+    expect(context.emitted[0].source).toContain('id="foo/check"')
+  })
+
+  it('deduplicates symbols across transform and content scanning', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'templates/page.latte', '<use href="#foo/check"></use>')
+
+    const plugin = heroicons({
+      content: ['templates/**/*.latte'],
+      inject: false,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+    plugin.transform.handler('<use href="#foo/check"></use>', '/src/app.html', { ssr: false })
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks)
+
+    expect(context.emitted).toHaveLength(1)
+    expect(context.emitted[0].source.match(/<symbol id="foo\/check"/g)).toHaveLength(1)
   })
 
   it('resolves icon sets from multiple directories in order', async () => {
