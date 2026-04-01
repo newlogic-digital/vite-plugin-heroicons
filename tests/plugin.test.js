@@ -315,6 +315,45 @@ describe('heroicons plugin', () => {
     expect(transformed.tags[0].children).toContain('id="foo/check"')
   })
 
+  it('waits for dev pre-transforms before injecting sprite', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({
+      inject: true,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const transformed = await plugin.transformIndexHtml.handler.call(
+      context.hooks,
+      '<html><body></body></html>',
+      {
+        filename: '/src/index.html',
+        path: '/index.html',
+        server: {
+          async waitForRequestsIdle() {
+            plugin.transform.handler(
+              '<svg><use href="#foo/check"></use></svg>',
+              '/src/app.js',
+              { ssr: false },
+            )
+          },
+        },
+      },
+    )
+
+    expect(typeof transformed).toBe('object')
+    expect(transformed.tags).toHaveLength(1)
+    expect(transformed.tags[0].children).toContain('id="foo/check"')
+  })
+
   it('skips collecting refs during server transforms via environment consumer', async () => {
     const root = await createTempRoot()
 

@@ -306,6 +306,7 @@ export default function heroicons(userOptions = {}) {
         replaceFileRefs(key, extractIconIds(html, hrefRe, codeNeedles))
 
         if (!options.inject || shouldSkipHtmlInject(normalizedId)) return html
+        if (ctx.server) await ctx.server.waitForRequestsIdle()
 
         const sprite = await getSprite(this)
         if (!sprite.inner) return html
