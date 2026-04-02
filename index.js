@@ -349,6 +349,7 @@ export default function heroicons(userOptions = {}) {
       '--no-config',
       '--color=never',
       '--hidden',
+      '--follow',
       '--glob', '!**/.git/**',
       '--glob', '!**/node_modules/**',
       '--glob', '!**/dist/**',

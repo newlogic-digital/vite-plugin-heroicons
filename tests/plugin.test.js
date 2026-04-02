@@ -223,6 +223,32 @@ describe('heroicons plugin', () => {
     expect(context.emitted[0].source.match(/<symbol id="foo\/check"/g)).toHaveLength(1)
   })
 
+  it('collects icons from symlinked content files during generateBundle', async () => {
+    const root = await createTempRoot()
+
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'shared/page.latte', '<use href="#foo/check"></use>')
+    await fsPromises.mkdir(path.join(root, 'templates'), { recursive: true })
+    await fsPromises.symlink('../shared/page.latte', path.join(root, 'templates', 'page.latte'))
+
+    const plugin = heroicons({
+      content: ['templates/**/*.latte'],
+      inject: false,
+      iconSets: {
+        foo: 'icons',
+      },
+    })
+
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks)
+
+    expect(context.emitted).toHaveLength(1)
+    expect(context.emitted[0].source).toContain('id="foo/check"')
+  })
+
   it('resolves icon sets from multiple directories in order', async () => {
     const root = await createTempRoot()
 
