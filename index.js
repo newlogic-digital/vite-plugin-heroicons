@@ -3,7 +3,14 @@ import { promises as fs } from 'node:fs'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
+import MagicString from 'magic-string'
 import { normalizePath } from 'vite'
+
+const PLUGIN_NAME = '@newlogic-digital/vite-plugin-heroicons'
+const VIRTUAL_MODULE_ID = `virtual:${PLUGIN_NAME}`
+const RESOLVED_VIRTUAL_MODULE_ID = `\0${VIRTUAL_MODULE_ID}`
+const SPRITE_MARKER_ATTRIBUTE = 'data-vite-plugin-heroicons'
 
 const DEFAULT_ICON_SETS = {
   'heroicons-outline': 'node_modules/heroicons/24/outline',
@@ -16,15 +23,43 @@ const DEFAULT_OPTIONS = {
   fileName: 'heroicons.svg',
   className: 'hidden',
   content: undefined,
+  emitFile: undefined,
   inject: true,
   injectExclude: /\.json\.[^.]+\.html$/i,
 }
 
 const SVG_RE = /<svg\b([^>]*)>([\s\S]*?)<\/svg>/i
 const VIEW_BOX_RE = /\bviewBox\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i
-const TRANSFORM_ID_RE = /\.(?:[cm]?[jt]sx?|html|json|latte|twig|liquid|njk|hbs|pug|vue|svelte|astro)(?:\?.*)?$/i
+const TRANSFORM_ID_RE = /\.(?:[cm]?[jt]sx?|html|json|mdx?|latte|twig|liquid|njk|hbs|pug|vue|svelte|astro|marko)(?:\?.*)?$/i
+const HTML_FILE_RE = /\.html?$/i
+const HTML_CONTENT_TYPE_RE = /^text\/html(?:\s*;|$)/i
 const BASE_STRIP_RE = /\s(?:xmlns|fill|stroke|stroke-width|aria-hidden|data-slot)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi
 const OUTLINE_STRIP_RE = /\s(?:stroke-linecap|stroke-linejoin)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi
+const BODY_CLOSE_RE = /<\/body\s*>/i
+const HTML_CLOSE_RE = /<\/html\s*>/i
+const SPRITE_MARKER_RE = /\sdata-vite-plugin-heroicons(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/i
+
+const SOURCE_SCAN_IGNORES = new Set(['.git', 'dist', 'node_modules'])
+const BODYLESS_STATUSES = new Set([101, 204, 205, 304])
+const DEV_HTML_REFS_LIMIT = 500
+const FILE_IO_CONCURRENCY = 32
+const MAX_SCANNED_FILE_SIZE = 4 * 1024 * 1024
+
+const mapWithConcurrency = async (items, limit, task) => {
+  const results = Array.from({ length: items.length })
+  let cursor = 0
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      results[index] = await task(items[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
 
 const EMPTY_ICON_IDS = new Set()
 
@@ -41,10 +76,138 @@ const resolveIconSetPaths = (root, iconSetPath) => (
   ))
 )
 
+const sourceToString = source => (
+  typeof source === 'string' ? source : Buffer.from(source).toString('utf8')
+)
+
+const chunkToBuffer = (chunk, encoding) => (
+  Buffer.isBuffer(chunk)
+    ? chunk
+    : Buffer.from(chunk, /** @type {BufferEncoding | undefined} */ (typeof encoding === 'string' ? encoding : undefined))
+)
+
+const isHtmlContentType = value => HTML_CONTENT_TYPE_RE.test(String(value ?? ''))
+
+const isInsideDirectory = (root, candidate) => {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+}
+
+const listFiles = async (directory, predicate, files = [], visitedDirs = new Set()) => {
+  /** @type {string} */
+  let realDirectory
+  /** @type {import('node:fs').Dirent[]} */
+  let entries
+  try {
+    realDirectory = await fs.realpath(directory)
+    entries = await fs.readdir(directory, { withFileTypes: true })
+  }
+  catch (error) {
+    if (error?.code === 'ENOENT') return files
+    throw error
+  }
+
+  // Symlinks are followed, so cycle detection has to happen on resolved paths.
+  if (visitedDirs.has(realDirectory)) return files
+  visitedDirs.add(realDirectory)
+
+  for (const entry of entries) {
+    const filePath = path.join(directory, entry.name)
+    let isDirectory = entry.isDirectory()
+    let isFile = entry.isFile()
+
+    if (entry.isSymbolicLink()) {
+      try {
+        const stats = await fs.stat(filePath)
+        isDirectory = stats.isDirectory()
+        isFile = stats.isFile()
+      }
+      catch {
+        continue
+      }
+    }
+
+    if (isDirectory) {
+      if (!SOURCE_SCAN_IGNORES.has(entry.name)) await listFiles(filePath, predicate, files, visitedDirs)
+      continue
+    }
+
+    if (isFile && predicate(filePath)) files.push(filePath)
+  }
+
+  return files
+}
+
+const findGeneratedSpriteRange = (html) => {
+  let markerIndex = html.indexOf(SPRITE_MARKER_ATTRIBUTE)
+  // Lower-casing copies the whole document, so only pay for it once a marker exists.
+  if (markerIndex < 0) return null
+
+  const lowerHtml = html.toLowerCase()
+
+  while (markerIndex >= 0) {
+    const start = lowerHtml.lastIndexOf('<svg', markerIndex)
+    const openingEnd = start >= 0 ? html.indexOf('>', start) : -1
+
+    if (start >= 0 && openingEnd >= markerIndex) {
+      const tagRe = /<\/?svg\b[^>]*>/gi
+      tagRe.lastIndex = start
+      let depth = 0
+      let match
+
+      while ((match = tagRe.exec(html)) !== null) {
+        if (match.index === start || depth > 0) {
+          if (/^<\/svg/i.test(match[0])) depth -= 1
+          else if (!/\/>$/.test(match[0])) depth += 1
+
+          if (depth === 0) return { start, end: tagRe.lastIndex }
+        }
+      }
+    }
+
+    markerIndex = html.indexOf(SPRITE_MARKER_ATTRIBUTE, markerIndex + SPRITE_MARKER_ATTRIBUTE.length)
+  }
+
+  return null
+}
+
+const findSpriteInsertion = (html) => {
+  const existing = findGeneratedSpriteRange(html)
+  if (existing) return existing
+
+  const bodyClose = BODY_CLOSE_RE.exec(html)
+  if (bodyClose) return { start: bodyClose.index, end: bodyClose.index }
+
+  const htmlClose = HTML_CLOSE_RE.exec(html)
+  if (htmlClose) return { start: htmlClose.index, end: htmlClose.index }
+
+  return { start: html.length, end: html.length }
+}
+
+const injectSpriteIntoHtml = (html, sprite) => {
+  if (!sprite) return html
+
+  const { start, end } = findSpriteInsertion(html)
+  return `${html.slice(0, start)}${sprite}${html.slice(end)}`
+}
+
+const stripSpriteMarker = value => value.replace(SPRITE_MARKER_RE, '')
+
 const isServerTransform = (ctx, options) => (
   ctx?.environment?.config?.consumer === 'server'
   || options?.ssr === true
 )
+
+const isAstroComponentTransform = (ctx, options, id, code) => (
+  isServerTransform(ctx, options)
+  && /\.astro(?:\?.*)?$/i.test(id)
+  && code.includes('astro/compiler-runtime')
+)
+
+const escapeTemplateLiteralHtml = value => value
+  .replaceAll('\\', '\\\\')
+  .replaceAll('`', '\\`')
+  .replaceAll('${', '\\${')
 
 const containsAnyNeedle = (content, needles) => {
   for (const needle of needles) {
@@ -63,6 +226,73 @@ const matchesPathPattern = (value, pattern) => {
 
   return false
 }
+
+const serializePathPatterns = (patterns) => {
+  /** @type {Array<{ type: string, value?: string, source?: string, flags?: string }>} */
+  const serialized = []
+
+  for (const pattern of toArray(patterns)) {
+    if (typeof pattern === 'string') serialized.push({ type: 'string', value: pattern })
+    else if (pattern instanceof RegExp) serialized.push({ type: 'regexp', source: pattern.source, flags: pattern.flags })
+  }
+
+  return JSON.stringify(serialized)
+}
+
+const createResponseModuleCode = (markedSprite, options) => `
+const markedSprite = ${JSON.stringify(markedSprite)}
+const sprite = ${JSON.stringify(stripSpriteMarker(markedSprite))}
+const marker = ${JSON.stringify(SPRITE_MARKER_ATTRIBUTE)}
+const injectEnabled = ${JSON.stringify(Boolean(options.inject))}
+const excludedPatterns = ${serializePathPatterns(options.injectExclude)}
+const markerPattern = /\\sdata-vite-plugin-heroicons(?:\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+))?/i
+const bodyClosePattern = /<\\/body\\s*>/i
+const htmlClosePattern = /<\\/html\\s*>/i
+const htmlContentTypePattern = /^text\\/html(?:\\s*;|$)/i
+const skippedStatuses = new Set([101, 204, 205, 304])
+const isDev = Boolean(import.meta.env?.DEV)
+
+// Compiled once at module init instead of on every request.
+const excludedMatchers = excludedPatterns.map((pattern) => (
+  pattern.type === 'string'
+    ? (value) => value.includes(pattern.value)
+    : ((compiled) => (value) => compiled.test(value))(new RegExp(pattern.source, pattern.flags))
+))
+
+const isExcluded = (value) => excludedMatchers.some((matches) => matches(value))
+
+const injectIntoHtml = (html, preserveMarker) => {
+  if (!sprite) return html
+
+  const keepMarker = isDev || preserveMarker
+  if (html.includes(marker)) return keepMarker ? html : html.replace(markerPattern, '')
+
+  const injectedSprite = keepMarker ? markedSprite : sprite
+  if (bodyClosePattern.test(html)) return html.replace(bodyClosePattern, close => injectedSprite + close)
+  if (htmlClosePattern.test(html)) return html.replace(htmlClosePattern, close => injectedSprite + close)
+  return html + injectedSprite
+}
+
+export const injectHeroicons = async (response, pathname = '', runtimeOptions = {}) => {
+  response = await response
+  if (!injectEnabled || !sprite || isExcluded(pathname)) return response
+  if (skippedStatuses.has(response.status)) return response
+
+  const contentType = response.headers.get('content-type') || ''
+  const contentEncoding = response.headers.get('content-encoding') || ''
+  if (!htmlContentTypePattern.test(contentType) || (contentEncoding && contentEncoding !== 'identity')) return response
+
+  const html = await response.text()
+  const headers = new Headers(response.headers)
+  headers.delete('content-length')
+
+  return new Response(injectIntoHtml(html, runtimeOptions.preserveMarker === true), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+`
 
 const runRipgrep = (args, cwd) => new Promise((resolve, reject) => {
   const child = spawn('rg', args, {
@@ -168,7 +398,7 @@ export default function heroicons(userOptions = {}) {
   const codeNeedles = prefixes.map(prefix => `#${prefix}/`)
   const hrefRe = buildHrefRegExp(prefixes)
   const contentHrefPattern = buildContentHrefPattern(prefixes)
-  const codeFilter = codeNeedles.length <= 1 ? (codeNeedles[0] ?? '#heroicons-') : { include: codeNeedles }
+  const codeFilter = { include: [...codeNeedles, 'astro/compiler-runtime'] }
 
   const state = {
     refsByFile: new Map(),
@@ -177,11 +407,19 @@ export default function heroicons(userOptions = {}) {
     warnedIds: new Set(),
     iconDirs: {},
     root: process.cwd(),
+    sourceDirs: [],
+    command: null,
+    astroIntegration: false,
     contentScanned: false,
+    sourceScanned: false,
     spriteDirty: true,
+    spriteRevision: 0,
     /** @type {{ full: string, inner: string }} */
     sprite: EMPTY_SPRITE,
   }
+
+  /** @type {Set<string>} */
+  const devHtmlRefKeys = new Set()
 
   const setEmptySprite = () => {
     state.sprite = EMPTY_SPRITE
@@ -194,8 +432,11 @@ export default function heroicons(userOptions = {}) {
     state.refCountById.clear()
     state.symbolById.clear()
     state.warnedIds.clear()
+    devHtmlRefKeys.clear()
     state.contentScanned = false
+    state.sourceScanned = false
     state.spriteDirty = true
+    state.spriteRevision += 1
     state.sprite = EMPTY_SPRITE
   }
 
@@ -226,6 +467,7 @@ export default function heroicons(userOptions = {}) {
     }
 
     state.spriteDirty = true
+    state.spriteRevision += 1
   }
 
   const clearFileRefs = (filePath) => {
@@ -299,15 +541,20 @@ export default function heroicons(userOptions = {}) {
   const getSprite = async (ctx) => {
     if (!state.spriteDirty) return state.sprite
 
+    const revision = state.spriteRevision
     const iconIds = [...state.refCountById.keys()].sort()
     if (iconIds.length === 0) return setEmptySprite()
 
     const symbols = await Promise.all(iconIds.map(iconId => loadSymbol(ctx, iconId)))
     const inner = symbols.filter(Boolean).join('')
+    if (revision !== state.spriteRevision) return getSprite(ctx)
     if (!inner) return setEmptySprite()
 
     const classAttribute = options.className ? ` class="${escapeAttributeValue(options.className)}"` : ''
-    state.sprite = { full: `<svg${classAttribute}>${inner}</svg>`, inner }
+    state.sprite = {
+      full: `<svg${classAttribute} ${SPRITE_MARKER_ATTRIBUTE}="">${inner}</svg>`,
+      inner,
+    }
     state.spriteDirty = false
     return state.sprite
   }
@@ -377,16 +624,281 @@ export default function heroicons(userOptions = {}) {
     replaceFileRefs('content:build', iconIds.size > 0 ? iconIds : EMPTY_ICON_IDS)
   }
 
+  const scanSourceRefs = async (ctx) => {
+    if (state.sourceScanned || !hrefRe) return
+    state.sourceScanned = true
+
+    /** @type {Set<string>} */
+    const sourceFiles = new Set()
+
+    try {
+      for (const sourceDir of state.sourceDirs) {
+        const files = await listFiles(sourceDir, filePath => TRANSFORM_ID_RE.test(filePath))
+        for (const filePath of files) sourceFiles.add(filePath)
+      }
+    }
+    catch (error) {
+      ctx.warn(`Failed to scan framework source files: ${error.message}`)
+      return
+    }
+
+    const scanned = await mapWithConcurrency([...sourceFiles], FILE_IO_CONCURRENCY, async (filePath) => {
+      try {
+        // Guard against pulling oversized data files (e.g. a large JSON) into memory.
+        const stats = await fs.stat(filePath)
+        if (stats.size > MAX_SCANNED_FILE_SIZE) return null
+
+        const source = await fs.readFile(filePath, 'utf8')
+        return { filePath, iconIds: extractIconIds(source, hrefRe, codeNeedles) }
+      }
+      catch (error) {
+        if (error?.code !== 'ENOENT') ctx.warn(`Failed to scan source file "${filePath}": ${error.message}`)
+        return null
+      }
+    })
+
+    // Applied after the parallel reads so ref bookkeeping stays deterministic.
+    for (const entry of scanned) {
+      if (entry) replaceFileRefs(normalizeIdKey(entry.filePath), entry.iconIds)
+    }
+  }
+
   const shouldSkipHtmlInject = (id) => {
     const normalizedId = normalizeIdKey(id)
     return normalizedId.length > 0 && toArray(options.injectExclude).some(pattern => matchesPathPattern(normalizedId, pattern))
   }
 
-  return {
-    name: '@newlogic-digital/vite-plugin-heroicons',
+  const isScannedSourceFile = filePath => (
+    TRANSFORM_ID_RE.test(filePath)
+    && state.sourceDirs.some(sourceDir => isInsideDirectory(sourceDir, filePath))
+  )
+
+  // As an Astro integration with injection enabled, every page gets the sprite
+  // inlined, so the emitted file would be dead weight unless explicitly requested.
+  const shouldEmitSpriteFile = () => options.emitFile ?? !(state.astroIntegration && options.inject)
+
+  const trackDevHtmlRefKey = (key) => {
+    devHtmlRefKeys.delete(key)
+    devHtmlRefKeys.add(key)
+
+    if (devHtmlRefKeys.size <= DEV_HTML_REFS_LIMIT) return
+
+    const oldestKey = devHtmlRefKeys.values().next().value
+    devHtmlRefKeys.delete(oldestKey)
+    replaceFileRefs(oldestKey, EMPTY_ICON_IDS)
+  }
+
+  const transformRenderedHtml = async (ctx, html, id) => {
+    const normalizedId = normalizeIdKey(id)
+    const refKey = `html:${normalizedId}`
+    replaceFileRefs(refKey, extractIconIds(html, hrefRe, codeNeedles))
+    trackDevHtmlRefKey(refKey)
+
+    if (!options.inject || shouldSkipHtmlInject(normalizedId)) return html
+
+    const sprite = await getSprite(ctx)
+    return stripSpriteMarker(injectSpriteIntoHtml(html, sprite.full))
+  }
+
+  const collectBundleHtml = (bundle = {}) => {
+    const htmlAssets = []
+
+    for (const output of Object.values(bundle)) {
+      if (output.type !== 'asset' || !HTML_FILE_RE.test(output.fileName)) continue
+
+      const html = sourceToString(output.source)
+      replaceFileRefs(`html:bundle:${normalizeIdKey(output.fileName)}`, extractIconIds(html, hrefRe, codeNeedles))
+      htmlAssets.push({ output, html })
+    }
+
+    return htmlAssets
+  }
+
+  const writeGeneratedHtml = async (ctx, outputDirectory) => {
+    /** @type {string[]} */
+    let htmlFiles
+    try {
+      htmlFiles = await listFiles(outputDirectory, filePath => HTML_FILE_RE.test(filePath))
+    }
+    catch (error) {
+      ctx.warn(`Failed to inspect generated HTML in "${outputDirectory}": ${error.message}`)
+      return
+    }
+
+    const readPages = await mapWithConcurrency(htmlFiles, FILE_IO_CONCURRENCY, async (filePath) => {
+      try {
+        const html = await fs.readFile(filePath, 'utf8')
+        return { filePath, relativePath: normalizePath(path.relative(outputDirectory, filePath)), html }
+      }
+      catch (error) {
+        ctx.warn(`Failed to read generated HTML "${filePath}": ${error.message}`)
+        return null
+      }
+    })
+
+    // Applied after the parallel reads so ref bookkeeping stays deterministic.
+    const generatedPages = readPages.filter(Boolean)
+    for (const page of generatedPages) {
+      replaceFileRefs(`html:generated:${page.relativePath}`, extractIconIds(page.html, hrefRe, codeNeedles))
+    }
+
+    await scanSourceRefs(ctx)
+    await scanContentRefs(ctx)
+    const sprite = await getSprite(ctx)
+    if (!sprite.full) return
+
+    if (options.inject) {
+      await mapWithConcurrency(generatedPages, FILE_IO_CONCURRENCY, async (page) => {
+        if (shouldSkipHtmlInject(page.relativePath)) return
+
+        const transformed = stripSpriteMarker(injectSpriteIntoHtml(page.html, sprite.full))
+        if (transformed === page.html) return
+
+        try {
+          await fs.writeFile(page.filePath, transformed, 'utf8')
+        }
+        catch (error) {
+          ctx.warn(`Failed to write generated HTML "${page.filePath}": ${error.message}`)
+        }
+      })
+    }
+
+    if (!shouldEmitSpriteFile()) return
+
+    const assetPath = path.resolve(outputDirectory, options.fileName)
+    if (!isInsideDirectory(outputDirectory, assetPath)) {
+      ctx.warn(`Skipping emitted sprite "${options.fileName}" because it is outside the build directory.`)
+      return
+    }
+
+    await fs.mkdir(path.dirname(assetPath), { recursive: true })
+    await fs.writeFile(assetPath, stripSpriteMarker(sprite.full), 'utf8')
+  }
+
+  const createDevHtmlMiddleware = ctx => (req, res, next) => {
+    const method = req.method ?? 'GET'
+    const accept = String(req.headers?.accept ?? '')
+
+    if (
+      !options.inject
+      || method === 'HEAD'
+      || (method !== 'GET' && method !== 'POST')
+      || (accept && !accept.includes('text/html') && !accept.includes('*/*'))
+    ) {
+      next()
+      return
+    }
+
+    const originalWrite = res.write
+    const originalEnd = res.end
+    const chunks = []
+    let ended = false
+
+    const restore = () => {
+      res.write = originalWrite
+      res.end = originalEnd
+    }
+
+    const isPassthroughResponse = () => {
+      const contentType = res.getHeader('content-type')
+      if (contentType != null && !isHtmlContentType(contentType)) return true
+
+      const contentEncoding = res.getHeader('content-encoding')
+      return contentEncoding != null && String(contentEncoding) !== 'identity'
+    }
+
+    const flushBuffered = () => {
+      restore()
+      for (const buffered of chunks.splice(0)) originalWrite.call(res, buffered)
+    }
+
+    res.write = function bufferedWrite(chunk, encoding, callback) {
+      if (typeof encoding === 'function') {
+        callback = encoding
+        encoding = undefined
+      }
+
+      // Once the headers rule out HTML, hand the response back to keep streaming intact.
+      if (isPassthroughResponse()) {
+        flushBuffered()
+        return originalWrite.call(res, chunk, encoding, callback)
+      }
+
+      if (chunk != null) chunks.push(chunkToBuffer(chunk, encoding))
+      if (typeof callback === 'function') queueMicrotask(callback)
+      return true
+    }
+
+    res.end = function bufferedEnd(chunk, encoding, callback) {
+      if (ended) return res
+      ended = true
+
+      if (typeof chunk === 'function') {
+        callback = chunk
+        chunk = undefined
+        encoding = undefined
+      }
+      else if (typeof encoding === 'function') {
+        callback = encoding
+        encoding = undefined
+      }
+
+      // Single-shot non-HTML responses never buffered anything, so avoid the extra copy.
+      if (isPassthroughResponse()) {
+        flushBuffered()
+        return originalEnd.call(res, chunk, encoding, callback)
+      }
+
+      if (chunk != null) chunks.push(chunkToBuffer(chunk, encoding))
+
+      const originalBody = Buffer.concat(chunks)
+      const contentType = res.getHeader('content-type')
+      const contentEncoding = String(res.getHeader('content-encoding') ?? '')
+      const contentLength = res.getHeader('content-length')
+      const canChangeLength = !res.headersSent || contentLength == null
+      const shouldTransform = (
+        isHtmlContentType(contentType)
+        && (!contentEncoding || contentEncoding === 'identity')
+        && !BODYLESS_STATUSES.has(res.statusCode)
+        && canChangeLength
+      )
+
+      Promise.resolve()
+        .then(async () => {
+          if (!shouldTransform) return originalBody
+          const requestPath = req.originalUrl ?? req.url ?? ''
+          const html = originalBody.toString('utf8')
+          return Buffer.from(await transformRenderedHtml(ctx, html, requestPath))
+        })
+        .catch((error) => {
+          ctx.warn(`Failed to inject the Heroicons sprite into "${req.url ?? ''}": ${error.message}`)
+          return originalBody
+        })
+        .then((body) => {
+          restore()
+          if (!res.headersSent && contentLength != null) res.setHeader('content-length', body.byteLength)
+          originalEnd.call(res, body, callback)
+        })
+
+      return res
+    }
+
+    try {
+      next()
+    }
+    catch (error) {
+      restore()
+      throw error
+    }
+  }
+
+  const plugin = {
+    name: PLUGIN_NAME,
     enforce: 'post',
     configResolved(config) {
       state.root = config.root
+      state.command = config.command ?? state.command
+      if (state.sourceDirs.length === 0) state.sourceDirs = [path.resolve(config.root, 'src')]
       state.iconDirs = Object.fromEntries(
         Object.entries(options.iconSets).map(([prefix, iconSetPath]) => [
           prefix,
@@ -397,23 +909,78 @@ export default function heroicons(userOptions = {}) {
     buildStart() {
       resetBuildState()
     },
+    configureServer: {
+      order: 'pre',
+      handler(server) {
+        server.middlewares.use(createDevHtmlMiddleware(this))
+      },
+    },
+    resolveId(source) {
+      if (source === VIRTUAL_MODULE_ID) return RESOLVED_VIRTUAL_MODULE_ID
+      return null
+    },
+    async load(id) {
+      if (id !== RESOLVED_VIRTUAL_MODULE_ID) return null
+
+      await scanSourceRefs(this)
+      await scanContentRefs(this)
+      const sprite = await getSprite(this)
+      return createResponseModuleCode(sprite.full, options)
+    },
     transform: {
       filter: {
         id: TRANSFORM_ID_RE,
         code: codeFilter,
       },
-      handler(code, id, transformOptions) {
-        if (!hrefRe || isServerTransform(this, transformOptions)) return null
-
+      async handler(code, id, transformOptions) {
+        if (!hrefRe) return null
         // Fallback guard for environments that don't support hook filters yet.
         if (!TRANSFORM_ID_RE.test(id)) return null
 
+        const isAstroComponent = isAstroComponentTransform(this, transformOptions, id, code)
+        if (isServerTransform(this, transformOptions) && !isAstroComponent) return null
+
         replaceFileRefs(normalizeIdKey(id), extractIconIds(code, hrefRe, codeNeedles))
-        return null
+
+        if (!isAstroComponent) return null
+
+        await scanSourceRefs(this)
+        await scanContentRefs(this)
+        const sprite = await getSprite(this)
+        if (!options.inject || !sprite.full || shouldSkipHtmlInject(id)) return null
+        if (!BODY_CLOSE_RE.test(code) && !HTML_CLOSE_RE.test(code)) return null
+
+        const embeddedSprite = state.command === 'serve' || state.astroIntegration
+          ? sprite.full
+          : stripSpriteMarker(sprite.full)
+        const escapedSprite = escapeTemplateLiteralHtml(embeddedSprite)
+        const { start, end } = findSpriteInsertion(code)
+        if (code.slice(start, end) === escapedSprite) return null
+
+        const magicCode = new MagicString(code)
+        if (start === end) magicCode.appendLeft(start, escapedSprite)
+        else magicCode.overwrite(start, end, escapedSprite)
+
+        return {
+          code: magicCode.toString(),
+          map: magicCode.generateMap({ source: id, hires: 'boundary' }),
+        }
       },
     },
-    hotUpdate(options) {
-      clearFileRefs(options.file)
+    async hotUpdate({ file, type, read }) {
+      if (state.sourceScanned && type !== 'delete' && isScannedSourceFile(file)) {
+        try {
+          const source = await read()
+          replaceFileRefs(normalizeIdKey(file), extractIconIds(source, hrefRe, codeNeedles))
+          replaceFileRefs(`html:${normalizeIdKey(file)}`, EMPTY_ICON_IDS)
+          return
+        }
+        catch {
+          // Fall back to clearing the refs below when the file cannot be read.
+        }
+      }
+
+      clearFileRefs(file)
     },
     transformIndexHtml: {
       order: 'post',
@@ -433,7 +1000,10 @@ export default function heroicons(userOptions = {}) {
           tags: [
             {
               tag: 'svg',
-              attrs: options.className ? { class: options.className } : {},
+              attrs: {
+                ...(options.className ? { class: options.className } : {}),
+                [SPRITE_MARKER_ATTRIBUTE]: '',
+              },
               children: sprite.inner,
               injectTo: 'body',
             },
@@ -441,17 +1011,60 @@ export default function heroicons(userOptions = {}) {
         }
       },
     },
-    async generateBundle() {
+    async generateBundle(_outputOptions, bundle = {}) {
+      const htmlAssets = collectBundleHtml(bundle)
       await scanContentRefs(this)
 
       const sprite = await getSprite(this)
       if (!sprite.full) return
 
+      if (options.inject) {
+        for (const asset of htmlAssets) {
+          if (shouldSkipHtmlInject(asset.output.fileName)) continue
+          asset.output.source = stripSpriteMarker(injectSpriteIntoHtml(asset.html, sprite.full))
+        }
+      }
+
+      if (!shouldEmitSpriteFile()) return
+
       this.emitFile({
         type: 'asset',
         fileName: options.fileName,
-        source: sprite.full,
+        source: stripSpriteMarker(sprite.full),
       })
     },
   }
+
+  Object.defineProperty(plugin, 'hooks', {
+    enumerable: false,
+    value: {
+      'astro:config:setup': ({ config, updateConfig, addMiddleware }) => {
+        state.astroIntegration = true
+        const configuredPlugins = toArray(config.vite?.plugins).flat(Infinity)
+        if (!configuredPlugins.includes(plugin)) {
+          updateConfig({ vite: { plugins: [plugin] } })
+        }
+
+        if (options.inject) {
+          addMiddleware({
+            entrypoint: new URL('./astro/middleware.js', import.meta.url),
+            order: 'post',
+          })
+        }
+      },
+      'astro:config:done': ({ config }) => {
+        const sourceDir = config.srcDir instanceof URL
+          ? fileURLToPath(config.srcDir)
+          : path.resolve(config.root instanceof URL ? fileURLToPath(config.root) : state.root, config.srcDir ?? 'src')
+
+        state.sourceDirs = [sourceDir]
+      },
+      'astro:build:done': async ({ dir, logger }) => {
+        const outputDirectory = dir instanceof URL ? fileURLToPath(dir) : path.resolve(state.root, dir)
+        await writeGeneratedHtml({ warn: message => logger.warn(message) }, outputDirectory)
+      },
+    },
+  })
+
+  return plugin
 }
