@@ -35,6 +35,8 @@ export default defineConfig({
 
 Registration through `vite.plugins` is still supported for existing Astro projects and covers the dev server and compiled Astro documents. Using `integrations` is recommended because it also covers bodyless pages, endpoints, prerendered output, and production SSR through Astro's own lifecycle.
 
+As an integration with `inject` enabled, the standalone `heroicons.svg` asset is not emitted because every page receives the sprite inline; set `emitFile: true` if you also want the file.
+
 ## Other metaframeworks
 
 If a framework returns HTML after Vite's build hooks have finished, call the framework-neutral response transformer from its server middleware. For example, in SvelteKit:
@@ -53,6 +55,7 @@ The virtual module accepts a `Response` or `Promise<Response>`, only transforms 
 ## Options
 
 - `fileName` (`string`, default: `"heroicons.svg"`): emitted asset file name.
+- `emitFile` (`boolean`): emit the sprite as a standalone asset. Defaults to `true`, except when the plugin runs as an Astro integration with `inject` enabled — pages then get the sprite inlined, so the file is skipped unless you set `emitFile: true`.
 - `className` (`string`, default: `"hidden"`): class on generated sprite `<svg>`.
 - `content` (`string | string[]`): additional root-relative file paths or glob patterns scanned with ripgrep before the sprite is generated. This is useful for templates outside the Vite `src` directory.
 - `inject` (`boolean`, default: `true`): inject the sprite into HTML. This uses `transformIndexHtml` when available and framework-aware fallbacks otherwise.

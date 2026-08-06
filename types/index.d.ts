@@ -9,6 +9,7 @@ export interface HeroiconsOptions {
   fileName?: string
   className?: string
   content?: string | string[]
+  emitFile?: boolean
   inject?: boolean
   injectExclude?: HeroiconsPathPattern | HeroiconsPathPattern[]
   iconSets?: Record<string, HeroiconsIconSetPath>

@@ -627,7 +627,7 @@ describe('heroicons plugin', () => {
     await addIcon(root, 'icons', 'check', solidSvg)
     await addFile(root, 'dist/index.html', '<html><body><svg><use href="#foo/check"></use></svg></body></html>')
 
-    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    const plugin = heroicons({ iconSets: { foo: 'icons' }, emitFile: true })
     const updates = []
     const middlewares = []
 
@@ -666,6 +666,35 @@ describe('heroicons plugin', () => {
     expect(html).toContain('id="foo/check"')
     expect(sprite).toContain('id="foo/check"')
     expect(sprite).not.toContain('data-vite-plugin-heroicons')
+  })
+
+  it('skips the standalone sprite file by default when used as an Astro integration', async () => {
+    const root = await createTempRoot()
+    const outputDir = path.join(root, 'dist')
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'dist/index.html', '<html><body><svg><use href="#foo/check"></use></svg></body></html>')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.hooks['astro:config:setup']({
+      config: { vite: {} },
+      updateConfig() {},
+      addMiddleware() {},
+    })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    await plugin.hooks['astro:build:done']({
+      dir: pathToFileURL(`${outputDir}/`),
+      logger: { warn() {} },
+    })
+
+    const html = await fsPromises.readFile(path.join(outputDir, 'index.html'), 'utf8')
+    expect(html).toContain('id="foo/check"')
+    await expect(fsPromises.access(path.join(outputDir, 'heroicons.svg'))).rejects.toThrow()
+
+    const context = createContext()
+    await plugin.generateBundle.call(context.hooks, {}, {})
+    expect(context.emitted).toHaveLength(0)
   })
 
   it('streams non-HTML responses in dev without buffering', async () => {

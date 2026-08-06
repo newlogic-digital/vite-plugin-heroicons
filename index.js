@@ -23,6 +23,7 @@ const DEFAULT_OPTIONS = {
   fileName: 'heroicons.svg',
   className: 'hidden',
   content: undefined,
+  emitFile: undefined,
   inject: true,
   injectExclude: /\.json\.[^.]+\.html$/i,
 }
@@ -632,6 +633,10 @@ export default function heroicons(userOptions = {}) {
     && state.sourceDirs.some(sourceDir => isInsideDirectory(sourceDir, filePath))
   )
 
+  // As an Astro integration with injection enabled, every page gets the sprite
+  // inlined, so the emitted file would be dead weight unless explicitly requested.
+  const shouldEmitSpriteFile = () => options.emitFile ?? !(state.astroIntegration && options.inject)
+
   const trackDevHtmlRefKey = (key) => {
     devHtmlRefKeys.delete(key)
     devHtmlRefKeys.add(key)
@@ -706,6 +711,8 @@ export default function heroicons(userOptions = {}) {
         if (transformed !== page.html) await fs.writeFile(page.filePath, transformed, 'utf8')
       }
     }
+
+    if (!shouldEmitSpriteFile()) return
 
     const assetPath = path.resolve(outputDirectory, options.fileName)
     if (!isInsideDirectory(outputDirectory, assetPath)) {
@@ -960,6 +967,8 @@ export default function heroicons(userOptions = {}) {
           asset.output.source = stripSpriteMarker(injectSpriteIntoHtml(asset.html, sprite.full))
         }
       }
+
+      if (!shouldEmitSpriteFile()) return
 
       this.emitFile({
         type: 'asset',
