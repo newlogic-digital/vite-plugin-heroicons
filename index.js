@@ -40,7 +40,26 @@ const HTML_CLOSE_RE = /<\/html\s*>/i
 const SPRITE_MARKER_RE = /\sdata-vite-plugin-heroicons(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/i
 
 const SOURCE_SCAN_IGNORES = new Set(['.git', 'dist', 'node_modules'])
+const BODYLESS_STATUSES = new Set([101, 204, 205, 304])
 const DEV_HTML_REFS_LIMIT = 500
+const FILE_IO_CONCURRENCY = 32
+const MAX_SCANNED_FILE_SIZE = 4 * 1024 * 1024
+
+const mapWithConcurrency = async (items, limit, task) => {
+  const results = Array.from({ length: items.length })
+  let cursor = 0
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      results[index] = await task(items[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
 
 const EMPTY_ICON_IDS = new Set()
 
@@ -121,6 +140,9 @@ const listFiles = async (directory, predicate, files = [], visitedDirs = new Set
 
 const findGeneratedSpriteRange = (html) => {
   let markerIndex = html.indexOf(SPRITE_MARKER_ATTRIBUTE)
+  // Lower-casing copies the whole document, so only pay for it once a marker exists.
+  if (markerIndex < 0) return null
+
   const lowerHtml = html.toLowerCase()
 
   while (markerIndex >= 0) {
@@ -224,12 +246,20 @@ const marker = ${JSON.stringify(SPRITE_MARKER_ATTRIBUTE)}
 const injectEnabled = ${JSON.stringify(Boolean(options.inject))}
 const excludedPatterns = ${serializePathPatterns(options.injectExclude)}
 const markerPattern = /\\sdata-vite-plugin-heroicons(?:\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+))?/i
+const bodyClosePattern = /<\\/body\\s*>/i
+const htmlClosePattern = /<\\/html\\s*>/i
+const htmlContentTypePattern = /^text\\/html(?:\\s*;|$)/i
+const skippedStatuses = new Set([101, 204, 205, 304])
 const isDev = Boolean(import.meta.env?.DEV)
 
-const isExcluded = (value) => excludedPatterns.some((pattern) => {
-  if (pattern.type === 'string') return value.includes(pattern.value)
-  return new RegExp(pattern.source, pattern.flags).test(value)
-})
+// Compiled once at module init instead of on every request.
+const excludedMatchers = excludedPatterns.map((pattern) => (
+  pattern.type === 'string'
+    ? (value) => value.includes(pattern.value)
+    : ((compiled) => (value) => compiled.test(value))(new RegExp(pattern.source, pattern.flags))
+))
+
+const isExcluded = (value) => excludedMatchers.some((matches) => matches(value))
 
 const injectIntoHtml = (html, preserveMarker) => {
   if (!sprite) return html
@@ -238,19 +268,19 @@ const injectIntoHtml = (html, preserveMarker) => {
   if (html.includes(marker)) return keepMarker ? html : html.replace(markerPattern, '')
 
   const injectedSprite = keepMarker ? markedSprite : sprite
-  if (/<\\/body\\s*>/i.test(html)) return html.replace(/<\\/body\\s*>/i, close => injectedSprite + close)
-  if (/<\\/html\\s*>/i.test(html)) return html.replace(/<\\/html\\s*>/i, close => injectedSprite + close)
+  if (bodyClosePattern.test(html)) return html.replace(bodyClosePattern, close => injectedSprite + close)
+  if (htmlClosePattern.test(html)) return html.replace(htmlClosePattern, close => injectedSprite + close)
   return html + injectedSprite
 }
 
 export const injectHeroicons = async (response, pathname = '', runtimeOptions = {}) => {
   response = await response
   if (!injectEnabled || !sprite || isExcluded(pathname)) return response
-  if ([101, 204, 205, 304].includes(response.status)) return response
+  if (skippedStatuses.has(response.status)) return response
 
   const contentType = response.headers.get('content-type') || ''
   const contentEncoding = response.headers.get('content-encoding') || ''
-  if (!/^text\\/html(?:\\s*;|$)/i.test(contentType) || (contentEncoding && contentEncoding !== 'identity')) return response
+  if (!htmlContentTypePattern.test(contentType) || (contentEncoding && contentEncoding !== 'identity')) return response
 
   const html = await response.text()
   const headers = new Headers(response.headers)
@@ -612,14 +642,24 @@ export default function heroicons(userOptions = {}) {
       return
     }
 
-    for (const filePath of sourceFiles) {
+    const scanned = await mapWithConcurrency([...sourceFiles], FILE_IO_CONCURRENCY, async (filePath) => {
       try {
+        // Guard against pulling oversized data files (e.g. a large JSON) into memory.
+        const stats = await fs.stat(filePath)
+        if (stats.size > MAX_SCANNED_FILE_SIZE) return null
+
         const source = await fs.readFile(filePath, 'utf8')
-        replaceFileRefs(normalizeIdKey(filePath), extractIconIds(source, hrefRe, codeNeedles))
+        return { filePath, iconIds: extractIconIds(source, hrefRe, codeNeedles) }
       }
       catch (error) {
         if (error?.code !== 'ENOENT') ctx.warn(`Failed to scan source file "${filePath}": ${error.message}`)
+        return null
       }
+    })
+
+    // Applied after the parallel reads so ref bookkeeping stays deterministic.
+    for (const entry of scanned) {
+      if (entry) replaceFileRefs(normalizeIdKey(entry.filePath), entry.iconIds)
     }
   }
 
@@ -685,17 +725,21 @@ export default function heroicons(userOptions = {}) {
       return
     }
 
-    const generatedPages = []
-    for (const filePath of htmlFiles) {
+    const readPages = await mapWithConcurrency(htmlFiles, FILE_IO_CONCURRENCY, async (filePath) => {
       try {
         const html = await fs.readFile(filePath, 'utf8')
-        const relativePath = normalizePath(path.relative(outputDirectory, filePath))
-        replaceFileRefs(`html:generated:${relativePath}`, extractIconIds(html, hrefRe, codeNeedles))
-        generatedPages.push({ filePath, relativePath, html })
+        return { filePath, relativePath: normalizePath(path.relative(outputDirectory, filePath)), html }
       }
       catch (error) {
         ctx.warn(`Failed to read generated HTML "${filePath}": ${error.message}`)
+        return null
       }
+    })
+
+    // Applied after the parallel reads so ref bookkeeping stays deterministic.
+    const generatedPages = readPages.filter(Boolean)
+    for (const page of generatedPages) {
+      replaceFileRefs(`html:generated:${page.relativePath}`, extractIconIds(page.html, hrefRe, codeNeedles))
     }
 
     await scanSourceRefs(ctx)
@@ -704,12 +748,19 @@ export default function heroicons(userOptions = {}) {
     if (!sprite.full) return
 
     if (options.inject) {
-      for (const page of generatedPages) {
-        if (shouldSkipHtmlInject(page.relativePath)) continue
+      await mapWithConcurrency(generatedPages, FILE_IO_CONCURRENCY, async (page) => {
+        if (shouldSkipHtmlInject(page.relativePath)) return
 
         const transformed = stripSpriteMarker(injectSpriteIntoHtml(page.html, sprite.full))
-        if (transformed !== page.html) await fs.writeFile(page.filePath, transformed, 'utf8')
-      }
+        if (transformed === page.html) return
+
+        try {
+          await fs.writeFile(page.filePath, transformed, 'utf8')
+        }
+        catch (error) {
+          ctx.warn(`Failed to write generated HTML "${page.filePath}": ${error.message}`)
+        }
+      })
     }
 
     if (!shouldEmitSpriteFile()) return
@@ -792,6 +843,12 @@ export default function heroicons(userOptions = {}) {
         encoding = undefined
       }
 
+      // Single-shot non-HTML responses never buffered anything, so avoid the extra copy.
+      if (isPassthroughResponse()) {
+        flushBuffered()
+        return originalEnd.call(res, chunk, encoding, callback)
+      }
+
       if (chunk != null) chunks.push(chunkToBuffer(chunk, encoding))
 
       const originalBody = Buffer.concat(chunks)
@@ -802,7 +859,7 @@ export default function heroicons(userOptions = {}) {
       const shouldTransform = (
         isHtmlContentType(contentType)
         && (!contentEncoding || contentEncoding === 'identity')
-        && ![101, 204, 205, 304].includes(res.statusCode)
+        && !BODYLESS_STATUSES.has(res.statusCode)
         && canChangeLength
       )
 

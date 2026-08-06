@@ -818,4 +818,23 @@ describe('heroicons plugin', () => {
     expect(moduleCode).toContain('foo/check')
     expect(moduleCode).toContain('<symbol')
   })
+
+  it('skips oversized files when scanning framework sources', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addIcon(root, 'icons', 'star', solidSvg)
+    await addFile(root, 'src/small.latte', '<svg><use href="#foo/check"></use></svg>')
+    await addFile(root, 'src/huge.json', `${' '.repeat(5 * 1024 * 1024)}"<use href=\\"#foo/star\\">"`)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const moduleCode = await plugin.load.call(context.hooks, plugin.resolveId('virtual:@newlogic-digital/vite-plugin-heroicons'))
+
+    expect(moduleCode).toContain('foo/check')
+    expect(moduleCode).not.toContain('foo/star')
+    expect(context.warnings).toHaveLength(0)
+  })
 })
