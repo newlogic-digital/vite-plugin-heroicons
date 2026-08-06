@@ -1,6 +1,6 @@
 {
   "name": "@newlogic-digital/vite-plugin-heroicons",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "type": "module",
   "main": "index.js",
   "types": "types/index.d.ts",
@@ -21,7 +21,7 @@
     "publish-next": "npm publish --tag next"
   },
   "dependencies": {
-    "magic-string": "^0.30"
+    "magic-string": "^1.1.0"
   },
   "peerDependencies": {
     "astro": ">=5.0",
@@ -36,12 +36,12 @@
   "devDependencies": {
     "@eslint/js": "^10.0",
     "@stylistic/eslint-plugin": "^5.10",
-    "@types/node": "^25.5",
-    "eslint": "^10.0",
-    "globals": "^17.4",
+    "@types/node": "^26.1",
+    "eslint": "^10.8",
+    "globals": "^17.9",
     "heroicons": "^2.2",
-    "typescript": "^5.9",
-    "vite": "^8.0",
+    "typescript": "^7.0",
+    "vite": "^8.2",
     "vitest": "^4.1"
   },
   "files": [
@@ -61,5 +61,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/newlogic-digital/vite-plugin-heroicons.git"
+  },
+  "allowScripts": {
+    "fsevents": true
   }
 }
