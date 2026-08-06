@@ -1,6 +1,8 @@
+import { Buffer } from 'node:buffer'
 import { promises as fsPromises } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import heroicons from '../index.js'
 
@@ -462,6 +464,45 @@ describe('heroicons plugin', () => {
     expect(context.emitted).toHaveLength(0)
   })
 
+  it('injects compiled Astro documents during server transforms', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const transformed = await plugin.transform.handler.call(
+      { ...context.hooks, environment: { config: { consumer: 'server' } } },
+      'import { render } from "astro/compiler-runtime"; export default render`<html><body><use href="#foo/check"></use></body></html>`',
+      path.join(root, 'src/pages/index.astro'),
+    )
+
+    expect(transformed.code).not.toContain('data-vite-plugin-heroicons')
+    expect(transformed.code).toContain('id="foo/check"')
+    expect(transformed.code.indexOf('id="foo/check"')).toBeLessThan(transformed.code.indexOf('</body>'))
+    expect(transformed.map).toBeTruthy()
+  })
+
+  it('does not append HTML outside bodyless compiled Astro modules', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const transformed = await plugin.transform.handler.call(
+      { ...context.hooks, environment: { config: { consumer: 'server' } } },
+      'import { render } from "astro/compiler-runtime"; export default render`<use href="#foo/check"></use>`',
+      path.join(root, 'src/pages/index.astro'),
+    )
+
+    expect(transformed).toBeNull()
+  })
+
   it('builds transform code filter from configured icon prefixes', () => {
     const plugin = heroicons({
       iconSets: {
@@ -475,5 +516,277 @@ describe('heroicons plugin', () => {
     expect(Array.isArray(include)).toBe(true)
     expect(include).toContain('#foo/')
     expect(include).toContain('#bar/')
+  })
+
+  it('injects into HTML assets when transformIndexHtml is not called', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const bundle = {
+      'index.html': {
+        type: 'asset',
+        fileName: 'index.html',
+        source: '<html><body><svg><use href="#foo/check"></use></svg></body></html>',
+      },
+    }
+
+    await plugin.generateBundle.call(context.hooks, {}, bundle)
+
+    expect(bundle['index.html'].source).not.toContain('data-vite-plugin-heroicons')
+    expect(bundle['index.html'].source).toContain('id="foo/check"')
+    expect(context.emitted[0].source).not.toContain('data-vite-plugin-heroicons')
+  })
+
+  it('injects into framework HTML responses in dev', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    let middleware
+    plugin.configureServer.handler.call(context.hooks, {
+      middlewares: {
+        use(handler) {
+          middleware = handler
+        },
+      },
+    })
+
+    const headers = new Map()
+    let responseBody
+    const finished = new Promise((resolve) => {
+      const response = {
+        statusCode: 200,
+        headersSent: false,
+        getHeader(name) {
+          return headers.get(name)
+        },
+        setHeader(name, value) {
+          headers.set(name, value)
+        },
+        write() {},
+        end(chunk) {
+          responseBody = Buffer.from(chunk).toString('utf8')
+          resolve()
+        },
+      }
+
+      middleware(
+        { method: 'GET', headers: { accept: 'text/html' }, url: '/' },
+        response,
+        () => {
+          response.setHeader('content-type', 'text/html; charset=utf-8')
+          response.write('<html><body><svg>')
+          response.end('<use href="#foo/check"></use></svg></body></html>')
+        },
+      )
+    })
+
+    await finished
+    expect(responseBody).not.toContain('data-vite-plugin-heroicons')
+    expect(responseBody).toContain('id="foo/check"')
+  })
+
+  it('provides a response transformer virtual module for metaframeworks', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'src/page.svelte', '<svg><use href="#foo/check"></use></svg>')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const resolvedId = plugin.resolveId('virtual:@newlogic-digital/vite-plugin-heroicons')
+    const moduleCode = await plugin.load.call(context.hooks, resolvedId)
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(moduleCode).toString('base64')}`
+    const { injectHeroicons } = await import(moduleUrl)
+    const response = await injectHeroicons(
+      new Response('<html><body><svg><use href="#foo/check"></use></svg></body></html>', {
+        headers: { 'content-type': 'text/html' },
+      }),
+      '/',
+    )
+    const html = await response.text()
+
+    expect(html).not.toContain('data-vite-plugin-heroicons')
+    expect(html).toContain('id="foo/check"')
+  })
+
+  it('registers as an Astro integration and post-processes static output', async () => {
+    const root = await createTempRoot()
+    const outputDir = path.join(root, 'dist')
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'dist/index.html', '<html><body><svg><use href="#foo/check"></use></svg></body></html>')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    const updates = []
+    const middlewares = []
+
+    plugin.hooks['astro:config:setup']({
+      config: { vite: {} },
+      updateConfig(update) {
+        updates.push(update)
+      },
+      addMiddleware(middleware) {
+        middlewares.push(middleware)
+      },
+    })
+    plugin.hooks['astro:config:done']({
+      config: {
+        root: pathToFileURL(`${root}/`),
+        srcDir: pathToFileURL(`${path.join(root, 'src')}/`),
+      },
+    })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const warnings = []
+    await plugin.hooks['astro:build:done']({
+      dir: pathToFileURL(`${outputDir}/`),
+      logger: { warn: warning => warnings.push(warning) },
+    })
+
+    const html = await fsPromises.readFile(path.join(outputDir, 'index.html'), 'utf8')
+    const sprite = await fsPromises.readFile(path.join(outputDir, 'heroicons.svg'), 'utf8')
+
+    expect(updates[0].vite.plugins).toContain(plugin)
+    expect(middlewares[0].order).toBe('post')
+    expect(fileURLToPath(middlewares[0].entrypoint).endsWith('/astro/middleware.js')).toBe(true)
+    expect(warnings).toHaveLength(0)
+    expect(html).not.toContain('data-vite-plugin-heroicons')
+    expect(html).toContain('id="foo/check"')
+    expect(sprite).toContain('id="foo/check"')
+    expect(sprite).not.toContain('data-vite-plugin-heroicons')
+  })
+
+  it('streams non-HTML responses in dev without buffering', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    let middleware
+    plugin.configureServer.handler.call(context.hooks, {
+      middlewares: {
+        use(handler) {
+          middleware = handler
+        },
+      },
+    })
+
+    const headers = new Map()
+    const writtenChunks = []
+    let endedBody
+    const response = {
+      statusCode: 200,
+      headersSent: false,
+      getHeader(name) {
+        return headers.get(name)
+      },
+      setHeader(name, value) {
+        headers.set(name, value)
+      },
+      write(chunk) {
+        writtenChunks.push(Buffer.from(chunk).toString('utf8'))
+        return true
+      },
+      end(chunk) {
+        endedBody = chunk == null ? '' : Buffer.from(chunk).toString('utf8')
+      },
+    }
+
+    middleware(
+      { method: 'GET', headers: { accept: '*/*' }, url: '/module.js' },
+      response,
+      () => {
+        response.setHeader('content-type', 'application/javascript')
+        response.write('const a = 1\n')
+        expect(writtenChunks).toEqual(['const a = 1\n'])
+        response.write('const b = 2\n')
+        response.end('export default a + b\n')
+      },
+    )
+
+    expect(writtenChunks).toEqual(['const a = 1\n', 'const b = 2\n'])
+    expect(endedBody).toBe('export default a + b\n')
+  })
+
+  it('keeps icons from scanned source files across hot updates', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+    const sourcePath = path.join(root, 'src/parts/menu.latte')
+    await addFile(root, 'src/parts/menu.latte', '<svg><use href="#foo/check"></use></svg>')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    await plugin.load.call(context.hooks, plugin.resolveId('virtual:@newlogic-digital/vite-plugin-heroicons'))
+
+    await plugin.hotUpdate({
+      file: sourcePath,
+      type: 'update',
+      read: () => fsPromises.readFile(sourcePath, 'utf8'),
+    })
+
+    const bundleContext = createContext()
+    await plugin.generateBundle.call(bundleContext.hooks, {}, {})
+
+    expect(bundleContext.emitted).toHaveLength(1)
+    expect(bundleContext.emitted[0].source).toContain('id="foo/check"')
+  })
+
+  it('injects sprites containing replacement patterns verbatim', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'money', '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><title>$& $\' costs</title><path d="M0 0h20v20H0z"/></svg>')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const bundle = {
+      'index.html': {
+        type: 'asset',
+        fileName: 'index.html',
+        source: '<html><body><svg><use href="#foo/money"></use></svg></body></html>',
+      },
+    }
+
+    await plugin.generateBundle.call(context.hooks, {}, bundle)
+
+    expect(bundle['index.html'].source).toContain('$& $\' costs')
+    expect(bundle['index.html'].source).toContain('</body></html>')
+  })
+
+  it('follows symlinked directories when scanning framework sources', async () => {
+    const root = await createTempRoot()
+    await addIcon(root, 'icons', 'check', solidSvg)
+    await addFile(root, 'shared/parts/menu.latte', '<svg><use href="#foo/check"></use></svg>')
+    await fsPromises.mkdir(path.join(root, 'src'), { recursive: true })
+    await fsPromises.symlink(path.join(root, 'shared'), path.join(root, 'src/shared'), 'dir')
+
+    const plugin = heroicons({ iconSets: { foo: 'icons' } })
+    plugin.configResolved({ root })
+    plugin.buildStart()
+
+    const context = createContext()
+    const moduleCode = await plugin.load.call(context.hooks, plugin.resolveId('virtual:@newlogic-digital/vite-plugin-heroicons'))
+
+    expect(moduleCode).toContain('foo/check')
+    expect(moduleCode).toContain('<symbol')
   })
 })
