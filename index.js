@@ -37,7 +37,7 @@ const BASE_STRIP_RE = /\s(?:xmlns|fill|stroke|stroke-width|aria-hidden|data-slot
 const OUTLINE_STRIP_RE = /\s(?:stroke-linecap|stroke-linejoin)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi
 const BODY_CLOSE_RE = /<\/body\s*>/i
 const HTML_CLOSE_RE = /<\/html\s*>/i
-const SPRITE_MARKER_RE = /\sdata-vite-plugin-heroicons(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/i
+const SPRITE_MARKER_RE = /\sdata-vite-plugin-heroicons(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/gi
 
 const SOURCE_SCAN_IGNORES = new Set(['.git', 'dist', 'node_modules'])
 const BODYLESS_STATUSES = new Set([101, 204, 205, 304])
@@ -138,12 +138,11 @@ const listFiles = async (directory, predicate, files = [], visitedDirs = new Set
   return files
 }
 
-const findGeneratedSpriteRange = (html) => {
-  let markerIndex = html.indexOf(SPRITE_MARKER_ATTRIBUTE)
-  // Lower-casing copies the whole document, so only pay for it once a marker exists.
-  if (markerIndex < 0) return null
-
-  const lowerHtml = html.toLowerCase()
+// The three sprite-matching helpers below are also serialized into the generated
+// response module via Function.prototype.toString, so they must stay self-contained:
+// only parameters, regex literals, and each other — no module-level bindings.
+const findGeneratedSpriteRange = (html, lowerHtml, marker, fromIndex) => {
+  let markerIndex = html.indexOf(marker, fromIndex)
 
   while (markerIndex >= 0) {
     const start = lowerHtml.lastIndexOf('<svg', markerIndex)
@@ -165,30 +164,83 @@ const findGeneratedSpriteRange = (html) => {
       }
     }
 
-    markerIndex = html.indexOf(SPRITE_MARKER_ATTRIBUTE, markerIndex + SPRITE_MARKER_ATTRIBUTE.length)
+    markerIndex = html.indexOf(marker, markerIndex + marker.length)
   }
 
   return null
 }
 
-const findSpriteInsertion = (html) => {
-  const existing = findGeneratedSpriteRange(html)
-  if (existing) return existing
+const findGeneratedSpriteRanges = (html, marker, cleanSprite = '') => {
+  const ranges = []
 
+  // Lower-casing copies the whole document, so only pay for it once a marker exists.
+  if (html.includes(marker)) {
+    const lowerHtml = html.toLowerCase()
+    let cursor = 0
+
+    while (cursor < html.length) {
+      const range = findGeneratedSpriteRange(html, lowerHtml, marker, cursor)
+      if (!range) break
+
+      ranges.push(range)
+      cursor = range.end
+    }
+  }
+
+  if (cleanSprite) {
+    let spriteIndex = html.indexOf(cleanSprite)
+    while (spriteIndex >= 0) {
+      ranges.push({ start: spriteIndex, end: spriteIndex + cleanSprite.length })
+      spriteIndex = html.indexOf(cleanSprite, spriteIndex + cleanSprite.length)
+    }
+  }
+
+  ranges.sort((left, right) => left.start - right.start)
+
+  const nonOverlapping = []
+  for (const range of ranges) {
+    const previous = nonOverlapping.at(-1)
+    if (!previous || range.start >= previous.end) nonOverlapping.push(range)
+  }
+
+  return nonOverlapping
+}
+
+const replaceGeneratedSprites = (html, marker, cleanSprite, replacement) => {
+  const ranges = findGeneratedSpriteRanges(html, marker, cleanSprite)
+  if (ranges.length === 0) return null
+
+  const chunks = []
+  let cursor = 0
+
+  for (const [index, range] of ranges.entries()) {
+    chunks.push(html.slice(cursor, range.start))
+    if (index === 0) chunks.push(replacement)
+    cursor = range.end
+  }
+
+  chunks.push(html.slice(cursor))
+  return chunks.join('')
+}
+
+const findSpriteInsertion = (html) => {
   const bodyClose = BODY_CLOSE_RE.exec(html)
-  if (bodyClose) return { start: bodyClose.index, end: bodyClose.index }
+  if (bodyClose) return bodyClose.index
 
   const htmlClose = HTML_CLOSE_RE.exec(html)
-  if (htmlClose) return { start: htmlClose.index, end: htmlClose.index }
+  if (htmlClose) return htmlClose.index
 
-  return { start: html.length, end: html.length }
+  return html.length
 }
 
 const injectSpriteIntoHtml = (html, sprite) => {
   if (!sprite) return html
 
-  const { start, end } = findSpriteInsertion(html)
-  return `${html.slice(0, start)}${sprite}${html.slice(end)}`
+  const normalized = replaceGeneratedSprites(html, SPRITE_MARKER_ATTRIBUTE, stripSpriteMarker(sprite), sprite)
+  if (normalized !== null) return normalized
+
+  const insertAt = findSpriteInsertion(html)
+  return `${html.slice(0, insertAt)}${sprite}${html.slice(insertAt)}`
 }
 
 const stripSpriteMarker = value => value.replace(SPRITE_MARKER_RE, '')
@@ -245,7 +297,7 @@ const sprite = ${JSON.stringify(stripSpriteMarker(markedSprite))}
 const marker = ${JSON.stringify(SPRITE_MARKER_ATTRIBUTE)}
 const injectEnabled = ${JSON.stringify(Boolean(options.inject))}
 const excludedPatterns = ${serializePathPatterns(options.injectExclude)}
-const markerPattern = /\\sdata-vite-plugin-heroicons(?:\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+))?/i
+const markerPattern = /\\sdata-vite-plugin-heroicons(?:\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+))?/gi
 const bodyClosePattern = /<\\/body\\s*>/i
 const htmlClosePattern = /<\\/html\\s*>/i
 const htmlContentTypePattern = /^text\\/html(?:\\s*;|$)/i
@@ -261,16 +313,24 @@ const excludedMatchers = excludedPatterns.map((pattern) => (
 
 const isExcluded = (value) => excludedMatchers.some((matches) => matches(value))
 
+const findGeneratedSpriteRange = ${findGeneratedSpriteRange.toString()}
+
+const findGeneratedSpriteRanges = ${findGeneratedSpriteRanges.toString()}
+
+const replaceGeneratedSprites = ${replaceGeneratedSprites.toString()}
+
 const injectIntoHtml = (html, preserveMarker) => {
   if (!sprite) return html
 
   const keepMarker = isDev || preserveMarker
-  if (html.includes(marker)) return keepMarker ? html : html.replace(markerPattern, '')
-
   const injectedSprite = keepMarker ? markedSprite : sprite
-  if (bodyClosePattern.test(html)) return html.replace(bodyClosePattern, close => injectedSprite + close)
-  if (htmlClosePattern.test(html)) return html.replace(htmlClosePattern, close => injectedSprite + close)
-  return html + injectedSprite
+  const normalized = replaceGeneratedSprites(html, marker, sprite, injectedSprite)
+  if (normalized !== null) return keepMarker ? normalized : normalized.replace(markerPattern, '')
+
+  const cleanHtml = keepMarker ? html : html.replace(markerPattern, '')
+  if (bodyClosePattern.test(cleanHtml)) return cleanHtml.replace(bodyClosePattern, close => injectedSprite + close)
+  if (htmlClosePattern.test(cleanHtml)) return cleanHtml.replace(htmlClosePattern, close => injectedSprite + close)
+  return cleanHtml + injectedSprite
 }
 
 export const injectHeroicons = async (response, pathname = '', runtimeOptions = {}) => {
@@ -942,7 +1002,10 @@ export default function heroicons(userOptions = {}) {
 
         replaceFileRefs(normalizeIdKey(id), extractIconIds(code, hrefRe, codeNeedles))
 
-        if (!isAstroComponent) return null
+        // The Astro integration injects through its middleware. Keeping the
+        // compiled-document fallback active as well would create two owners
+        // for the same response.
+        if (!isAstroComponent || state.astroIntegration) return null
 
         await scanSourceRefs(this)
         await scanContentRefs(this)
@@ -954,12 +1017,21 @@ export default function heroicons(userOptions = {}) {
           ? sprite.full
           : stripSpriteMarker(sprite.full)
         const escapedSprite = escapeTemplateLiteralHtml(embeddedSprite)
-        const { start, end } = findSpriteInsertion(code)
-        if (code.slice(start, end) === escapedSprite) return null
+        const existingRanges = findGeneratedSpriteRanges(code, SPRITE_MARKER_ATTRIBUTE, stripSpriteMarker(escapedSprite))
+        if (existingRanges.length === 1 && code.slice(existingRanges[0].start, existingRanges[0].end) === escapedSprite) {
+          return null
+        }
 
         const magicCode = new MagicString(code)
-        if (start === end) magicCode.appendLeft(start, escapedSprite)
-        else magicCode.overwrite(start, end, escapedSprite)
+        if (existingRanges.length === 0) {
+          magicCode.appendLeft(findSpriteInsertion(code), escapedSprite)
+        }
+        else {
+          for (const [index, range] of existingRanges.entries()) {
+            if (index === 0) magicCode.overwrite(range.start, range.end, escapedSprite)
+            else magicCode.remove(range.start, range.end)
+          }
+        }
 
         return {
           code: magicCode.toString(),
@@ -989,11 +1061,15 @@ export default function heroicons(userOptions = {}) {
         const key = `html:${normalizedId}`
         replaceFileRefs(key, extractIconIds(html, hrefRe, codeNeedles))
 
-        if (!options.inject || shouldSkipHtmlInject(normalizedId)) return html
+        if (!options.inject || state.astroIntegration || shouldSkipHtmlInject(normalizedId)) return html
         if (ctx.server) await ctx.server.waitForRequestsIdle()
 
         const sprite = await getSprite(this)
         if (!sprite.inner) return html
+
+        const cleanSprite = stripSpriteMarker(sprite.full)
+        const normalized = replaceGeneratedSprites(html, SPRITE_MARKER_ATTRIBUTE, cleanSprite, cleanSprite)
+        if (normalized !== null) return normalized
 
         return {
           html,
@@ -1041,7 +1117,8 @@ export default function heroicons(userOptions = {}) {
       'astro:config:setup': ({ config, updateConfig, addMiddleware }) => {
         state.astroIntegration = true
         const configuredPlugins = toArray(config.vite?.plugins).flat(Infinity)
-        if (!configuredPlugins.includes(plugin)) {
+        const alreadyConfigured = configuredPlugins.some(configuredPlugin => configuredPlugin?.name === PLUGIN_NAME)
+        if (!alreadyConfigured) {
           updateConfig({ vite: { plugins: [plugin] } })
         }
 
@@ -1053,11 +1130,21 @@ export default function heroicons(userOptions = {}) {
         }
       },
       'astro:config:done': ({ config }) => {
+        const rootDirectory = config.root instanceof URL
+          ? fileURLToPath(config.root)
+          : path.resolve(state.root, config.root ?? '.')
         const sourceDir = config.srcDir instanceof URL
           ? fileURLToPath(config.srcDir)
-          : path.resolve(config.root instanceof URL ? fileURLToPath(config.root) : state.root, config.srcDir ?? 'src')
+          : path.resolve(rootDirectory, config.srcDir ?? 'src')
 
+        state.root = rootDirectory
         state.sourceDirs = [sourceDir]
+        state.iconDirs = Object.fromEntries(
+          Object.entries(options.iconSets).map(([prefix, iconSetPath]) => [
+            prefix,
+            resolveIconSetPaths(rootDirectory, iconSetPath),
+          ]),
+        )
       },
       'astro:build:done': async ({ dir, logger }) => {
         const outputDirectory = dir instanceof URL ? fileURLToPath(dir) : path.resolve(state.root, dir)
